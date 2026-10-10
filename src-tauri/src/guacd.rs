@@ -104,10 +104,15 @@ fn find_binary(explicit: Option<&str>) -> Option<PathBuf> {
 ///   <prefix>/lib/freerdp3/libguac-*-client.so
 fn sidecar_env(binary: &Path) -> Vec<(String, String)> {
     let mut env = Vec::new();
-    let lib = binary
-        .parent()
-        .and_then(|sbin| sbin.parent())
-        .map(|prefix| prefix.join("lib"));
+    // Two layouts: <prefix>/sbin/guacd + <prefix>/lib (dev tree / bundled
+    // tree) and the packaged flat layout /usr/lib/trdc/guacd +
+    // /usr/lib/trdc/lib. Try both.
+    let parent = binary.parent();
+    let lib = parent
+        .and_then(|p| p.parent().map(|prefix| prefix.join("lib")))
+        .filter(|l| l.is_dir())
+        .or_else(|| parent.map(|p| p.join("lib")))
+        .filter(|l| l.is_dir());
 
     if let Some(lib) = lib.filter(|l| l.is_dir()) {
         let mut ld = lib.display().to_string();
