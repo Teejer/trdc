@@ -1,0 +1,21 @@
+# Node / Vite
+node_modules/
+dist/
+*.local
+
+# Rust build output
+src-tauri/target/
+src-tauri/gen/
+
+# guacamole-server build tree (see README: build from source + patches/plugin_dir.patch)
+native/src/
+native/prefix/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Scratch
+scripts/*.png

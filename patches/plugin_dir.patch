@@ -1,0 +1,98 @@
+diff --git a/src/protocols/rdp/plugins/channels.c b/src/protocols/rdp/plugins/channels.c
+index 3ae3a85..6d79753 100644
+--- a/src/protocols/rdp/plugins/channels.c
++++ b/src/protocols/rdp/plugins/channels.c
+@@ -24,12 +24,77 @@
+ #include <freerdp/freerdp.h>
+ #include <freerdp/addin.h>
+ #include <guacamole/mem.h>
++#include <winpr/library.h>
+ #include <winpr/wtypes.h>
+ 
+ #include <stdarg.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
++/**
++ * Environment variable containing the directory to search for client channel
++ * plugin (.so) files before falling back to the directory that FreeRDP was
++ * compiled against. This allows guacd to ship its own copies of the
++ * guac-common-svc/guacai plugins alongside the binary rather than requiring
++ * them to be installed into the system FreeRDP plugin directory.
++ */
++#define GUAC_RDP_PLUGIN_DIR_ENV "GUAC_RDP_PLUGIN_DIR"
++
++/**
++ * Add-in provider which first checks the directory specified by the
++ * GUAC_RDP_PLUGIN_DIR environment variable, then defers to FreeRDP's normal
++ * dynamic add-in loading.
++ */
++static PVIRTUALCHANNELENTRY guac_rdp_addin_provider(const char* name,
++        const char* subsystem, const char* type, DWORD dwFlags) {
++
++    const char* dir = getenv(GUAC_RDP_PLUGIN_DIR_ENV);
++
++    /* Only bare client channel add-ins (no subsystem) are bundled alongside
++     * guacd; everything else falls through immediately. */
++    if (dir != NULL && name != NULL && subsystem == NULL) {
++
++        char path[4096];
++        snprintf(path, sizeof(path), "%s/lib%s-client.so", dir, name);
++
++        HMODULE library = LoadLibraryX(path);
++        if (library != NULL) {
++
++            PVIRTUALCHANNELENTRY entry = NULL;
++
++            if (dwFlags & FREERDP_ADDIN_CHANNEL_STATIC) {
++                if (dwFlags & FREERDP_ADDIN_CHANNEL_ENTRYEX)
++                    entry = (PVIRTUALCHANNELENTRY) (void*)
++                        GetProcAddress(library, "VirtualChannelEntryEx");
++                else
++                    entry = (PVIRTUALCHANNELENTRY) (void*)
++                        GetProcAddress(library, "VirtualChannelEntry");
++            }
++            else if (dwFlags & FREERDP_ADDIN_CHANNEL_DYNAMIC)
++                entry = (PVIRTUALCHANNELENTRY) (void*)
++                    GetProcAddress(library, "DVCPluginEntry");
++            else if (dwFlags & FREERDP_ADDIN_CHANNEL_DEVICE)
++                entry = (PVIRTUALCHANNELENTRY) (void*)
++                    GetProcAddress(library, "DeviceServiceEntry");
++            else if (type != NULL)
++                entry = (PVIRTUALCHANNELENTRY) (void*)
++                    GetProcAddress(library, type);
++
++            if (entry != NULL)
++                return entry;
++
++            FreeLibrary(library);
++
++        }
++
++    }
++
++    /* Defer to FreeRDP's own dynamic add-in loading (default plugin dir). */
++    return freerdp_load_dynamic_channel_addin_entry(name, subsystem, type, dwFlags);
++
++}
++
+ int guac_rdp_wrapped_entry_ex_count = 0;
+ 
+ int guac_rdp_wrapped_entry_count = 0;
+@@ -85,6 +150,15 @@ int guac_freerdp_channels_load_plugin(rdpContext* context,
+ 
+     guac_client* client = ((rdp_freerdp_context*) context)->client;
+ 
++    /* Ensure our custom add-in provider (which checks GUAC_RDP_PLUGIN_DIR
++     * before the compiled-in FreeRDP plugin directory) is registered.
++     * Registration is idempotent; a benign race is harmless. */
++    static volatile int addin_provider_registered = 0;
++    if (!addin_provider_registered) {
++        addin_provider_registered = 1;
++        freerdp_register_addin_provider(guac_rdp_addin_provider, 0);
++    }
++
+     /* Load plugin using "ex" version of the channel plugin entry point, if it exists */
+     PVIRTUALCHANNELENTRYEX entry_ex = (PVIRTUALCHANNELENTRYEX) (void*) freerdp_load_channel_addin_entry(name,
+             NULL, NULL, FREERDP_ADDIN_CHANNEL_STATIC | FREERDP_ADDIN_CHANNEL_ENTRYEX);
