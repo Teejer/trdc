@@ -95,10 +95,19 @@ git clone --depth 1 --branch 1.6.0 https://github.com/apache/guacamole-server.gi
 cd src/guacamole-server && git apply ../../patches/plugin_dir.patch && cd ../..
 
 ./bootstrap
+export CPPFLAGS="$CPPFLAGS -Wno-error -Wno-deprecated-declarations"
 ./configure --prefix=$PWD/prefix --with-init-dir=/tmp/guacd-init \
     --enable-webp --with-freerdp-plugin-dir=$PWD/prefix/lib/freerdp3
 make -j$(nproc) && make install
 ```
+
+On Arch (and anywhere with recent FreeRDP): the `-Wno-error` **must go in
+CPPFLAGS, not CFLAGS**. guacamole-server's configure appends its own
+`-Werror` after `$CFLAGS` but before `$CPPFLAGS` when probing FreeRDP
+features; with `-Werror` last, deprecation warnings fail the
+`FREERDP_HAS_CONTEXT` probe, config.h silently takes the old-struct-layout
+branch, and the RDP plugin then fails to compile (or worse, miscompiles)
+against FreeRDP ≥ 3.32.
 
 `patches/plugin_dir.patch` teaches the RDP plugin to load FreeRDP channel
 plugins (`libguac-common-svc-client.so`) from `GUAC_RDP_PLUGIN_DIR` instead of

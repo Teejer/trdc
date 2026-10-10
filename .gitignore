@@ -19,3 +19,8 @@ native/prefix/
 
 # Scratch
 scripts/*.png
+
+# makepkg output
+pkg/src/
+pkg/pkg/
+*.pkg.tar.zst
