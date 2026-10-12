@@ -1,29 +1,33 @@
-//! Local WebSocket <-> TCP bridge.
+//! Local WebSocket <-> RDP session bridge.
 //!
-//! The webview can only speak WebSocket, while guacd speaks the raw
-//! Guacamole protocol over TCP. This bridge listens on a random loopback
-//! port; every accepted WebSocket connection is piped byte-for-byte to a
-//! fresh TCP connection to the currently-running guacd.
+//! The webview can only speak WebSocket, so every WS connection is one
+//! remote-desktop session. The first message must be a JSON "open" (protocol
+//! rdp + connection parameters); from then on the webview sends JSON input
+//! events and receives JSON control events plus binary pixel frames:
+//!
+//!   binary out: [u8 kind][i32le x][i32le y][i32le w][i32le h][payload]
+//!     kind 1 = screen tile (JPEG), kind 2 = cursor shape (PNG; x/y are the
+//!     hotspot). Text frames are JSON control messages.
 
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::WebSocketStream;
+use serde_json::{json, Value};
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
 
-/// Shared bridge state: the port the WS listener is bound to, and the
-/// (reconfigurable) port guacd is listening on.
+use crate::rdp::{ConnectParams, RunningSession, ServerEvent};
+
+/// Shared bridge state: the port the WS listener is bound to.
 pub struct BridgeState {
     pub ws_port: std::sync::Mutex<u16>,
-    pub guacd_port: std::sync::Mutex<u16>,
 }
 
 impl BridgeState {
     pub fn new() -> Self {
         Self {
             ws_port: std::sync::Mutex::new(0),
-            guacd_port: std::sync::Mutex::new(4822),
         }
     }
 }
@@ -47,10 +51,9 @@ pub async fn start_bridge(state: Arc<BridgeState>) -> Result<u16, String> {
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
-                    let state = Arc::clone(&state);
                     tauri::async_runtime::spawn(async move {
-                        if let Err(e) = handle_connection(stream, state).await {
-                            log::debug!("bridge connection from {peer} closed: {e}");
+                        if let Err(e) = handle_connection(stream).await {
+                            log::debug!("session connection from {peer} closed: {e}");
                         }
                     });
                 }
@@ -65,79 +68,212 @@ pub async fn start_bridge(state: Arc<BridgeState>) -> Result<u16, String> {
     Ok(port)
 }
 
+fn get_str(v: &Value, key: &str) -> String {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
+}
+
+fn get_u32(v: &Value, key: &str, default: u32) -> u32 {
+    v.get(key).and_then(|x| x.as_u64()).map(|x| x as u32).unwrap_or(default)
+}
+
+fn parse_open(v: &Value) -> Result<ConnectParams, String> {
+    if v.get("t").and_then(|t| t.as_str()) != Some("open") {
+        return Err("first message must be an open".into());
+    }
+    let protocol = get_str(v, "protocol");
+    if protocol != "rdp" {
+        return Err(format!("unsupported protocol {protocol:?}"));
+    }
+    let hostname = get_str(v, "hostname");
+    if hostname.is_empty() {
+        return Err("open message needs a hostname".into());
+    }
+    Ok(ConnectParams {
+        hostname,
+        port: get_u32(v, "port", 3389) as u16,
+        username: get_str(v, "username"),
+        password: get_str(v, "password"),
+        domain: get_str(v, "domain"),
+        width: get_u32(v, "width", 1280),
+        height: get_u32(v, "height", 800),
+        dpi: get_u32(v, "dpi", 96),
+        layout: {
+            let l = get_str(v, "layout");
+            if l.is_empty() { crate::rdp::keymap::DEFAULT_LAYOUT.to_string() } else { l }
+        },
+    })
+}
+
+/// One session per connection: open message, then pump both ways.
 async fn handle_connection(
     stream: TcpStream,
-    state: Arc<BridgeState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let guacd_port = {
-        let p = state.guacd_port.lock().map_err(|_| "poisoned")?;
-        *p
-    };
-
-    let ws = tokio_tungstenite::accept_async(stream)
+    let mut ws = tokio_tungstenite::accept_async(stream)
         .await
         .map_err(|e| format!("ws handshake failed: {e}"))?;
 
-    let tcp = TcpStream::connect(("127.0.0.1", guacd_port))
-        .await
-        .map_err(|e| format!("cannot reach guacd on port {guacd_port}: {e}"))?;
+    // First frame: the open message.
+    let open = loop {
+        match ws.next().await {
+            Some(Ok(Message::Text(text))) => break serde_json::from_str::<Value>(&text)
+                .map_err(|e| format!("open message is not valid JSON: {e}"))?,
+            Some(Ok(Message::Close(_))) | None => return Err("closed before open".into()),
+            Some(Err(e)) => return Err(format!("ws error: {e}").into()),
+            Some(Ok(_)) => continue, // ping/pong/etc before open
+        }
+    };
+    let params = match parse_open(&open) {
+        Ok(p) => p,
+        Err(e) => {
+            // Explain the rejection before hanging up; the webview shows
+            // this text on the session's error overlay.
+            let _ = ws
+                .send(Message::Text(
+                    json!({"t": "closed", "error": e}).to_string().into(),
+                ))
+                .await;
+            let _ = ws.send(Message::Close(None)).await;
+            return Err(e.into());
+        }
+    };
+    let label = format!("{}:{}", params.hostname, params.port);
 
-    log::debug!("bridged session connection -> guacd :{guacd_port}");
-    pump(ws, tcp).await
-}
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerEvent>();
+    // freerdp_connect blocks (TLS/NLA handshakes), so start off-runtime.
+    let mut session = tauri::async_runtime::spawn_blocking(move || {
+        let s = RunningSession::start(params, tx);
+        s.start_ticker();
+        s
+    })
+    .await
+    .map_err(|e| format!("session start panicked: {e}"))?;
 
-/// Pump bytes in both directions until either side closes.
-async fn pump(
-    ws: WebSocketStream<TcpStream>,
-    tcp: TcpStream,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (mut tcp_r, mut tcp_w) = tcp.into_split();
+    log::debug!("rdp session opened to {label}");
     let (mut ws_tx, mut ws_rx) = ws.split();
 
-    let ws_to_tcp = async {
-        while let Some(msg) = ws_rx.next().await {
-            match msg? {
-                tokio_tungstenite::tungstenite::Message::Binary(data) => {
-                    tcp_w.write_all(&data[..]).await?;
-                    tcp_w.flush().await?;
-                }
-                tokio_tungstenite::tungstenite::Message::Text(data) => {
-                    tcp_w.write_all(data.as_bytes()).await?;
-                    tcp_w.flush().await?;
-                }
-                tokio_tungstenite::tungstenite::Message::Close(_) => break,
-                _ => {}
-            }
-        }
-        Ok::<(), tokio_tungstenite::tungstenite::Error>(())
-    };
-
-    let tcp_to_ws = async {
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let n = tcp_r.read(&mut buf).await?;
-            if n == 0 {
+    // Server -> webview: forward events until the session reports Closed.
+    let mut out = tauri::async_runtime::spawn(async move {
+        let mut failed = false;
+        while let Some(ev) = rx.recv().await {
+            let closed = matches!(ev, ServerEvent::Closed { .. });
+            let msg = encode_event(ev);
+            let stop = ws_tx.send(msg).await.is_err();
+            if stop || closed {
+                failed = stop;
                 break;
             }
-            ws_tx
-                .send(tokio_tungstenite::tungstenite::Message::Binary(
-                    buf[..n].to_vec().into(),
-                ))
-                .await
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
         }
-        Ok::<(), std::io::Error>(())
+        // Tell the webview to drop the socket if we ended server-side; if
+        // the socket is already gone there is nothing to say.
+        if !failed {
+            let _ = ws_tx.send(Message::Close(None)).await;
+        }
+        ws_tx
+    });
+
+    // Webview -> server: JSON input events, straight into the session. The
+    // session is *owned* by this block so that whichever way the select
+    // below ends — block completion or cancellation — the RunningSession
+    // (and with it the FreeRDP loop and the last event-channel sender) is
+    // dropped, which is what lets the out task's rx.recv() wind down.
+    let input = async move {
+        while let Some(msg) = ws_rx.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    if !handle_input(&mut session, &text) {
+                        break; // {"t":"disconnect"}
+                    }
+                }
+                Ok(Message::Close(_)) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
     };
 
-    let (a, b) = tokio::join!(ws_to_tcp, tcp_to_ws);
-    a?;
-    b?;
+    // Drop-then-join: awaiting out before the session died would deadlock
+    // whenever the webview hung up while the RDP host kept painting. If out
+    // already completed inside the select its JoinHandle must not be polled
+    // again (tokio panics on poll-after-completion) — hence the await lives
+    // only in the input branch.
+    tokio::select! {
+        _ = input => { let _ = out.await; }
+        _ = &mut out => {}
+    };
+    log::debug!("rdp session closed: {label}");
     Ok(())
 }
 
-/// Set the port guacd is listening on (used when the sidecar (re)starts).
-pub fn set_guacd_port(state: &BridgeState, port: u16) {
-    if let Ok(mut p) = state.guacd_port.lock() {
-        *p = port;
+/// Translate one input event; returns false when the webview asked to
+/// disconnect.
+fn handle_input(session: &mut RunningSession, text: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(text) else {
+        return true;
+    };
+    match v.get("t").and_then(|t| t.as_str()).unwrap_or("") {
+        "mouse" => session.mouse(
+            v.get("x").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
+            v.get("y").and_then(|y| y.as_i64()).unwrap_or(0) as i32,
+            v.get("mask").and_then(|m| m.as_i64()).unwrap_or(0) as i32,
+        ),
+        "key" => {
+            let keysym = v.get("keysym").and_then(|k| k.as_i64()).unwrap_or(0) as i32;
+            let down = v.get("down").and_then(|d| d.as_i64()).unwrap_or(0) != 0;
+            if keysym != 0 {
+                session.keysym(keysym, down);
+            }
+        }
+        "locks" => {
+            let flags = v.get("flags").and_then(|f| f.as_u64()).unwrap_or(0) as u32;
+            session.sync_locks(flags);
+        }
+        "disconnect" => return false,
+        _ => {}
+    }
+    true
+}
+
+/// i32 little-endian append helper for the binary frame header.
+fn put_i32(buf: &mut Vec<u8>, v: i32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+fn encode_event(ev: ServerEvent) -> Message {
+    match ev {
+        ServerEvent::Ready { width, height } => Message::Text(
+            json!({"t": "ready", "width": width, "height": height}).to_string().into(),
+        ),
+        ServerEvent::Resize { width, height } => Message::Text(
+            json!({"t": "resize", "width": width, "height": height}).to_string().into(),
+        ),
+        ServerEvent::Frame { x, y, w, h, data } => {
+            let mut buf = Vec::with_capacity(17 + data.len());
+            buf.push(1u8);
+            put_i32(&mut buf, x as i32);
+            put_i32(&mut buf, y as i32);
+            put_i32(&mut buf, w as i32);
+            put_i32(&mut buf, h as i32);
+            buf.extend_from_slice(&data);
+            Message::Binary(buf.into())
+        }
+        ServerEvent::CursorPng { hotx, hoty, w, h, data } => {
+            let mut buf = Vec::with_capacity(17 + data.len());
+            buf.push(2u8);
+            put_i32(&mut buf, hotx);
+            put_i32(&mut buf, hoty);
+            put_i32(&mut buf, w as i32);
+            put_i32(&mut buf, h as i32);
+            buf.extend_from_slice(&data);
+            Message::Binary(buf.into())
+        }
+        ServerEvent::SystemCursor { name } => {
+            Message::Text(json!({"t": "system-cursor", "name": name}).to_string().into())
+        }
+        ServerEvent::CursorHide => Message::Text(json!({"t": "cursor-hide"}).to_string().into()),
+        ServerEvent::CursorPos { x, y } => {
+            Message::Text(json!({"t": "cursor-pos", "x": x, "y": y}).to_string().into())
+        }
+        ServerEvent::Closed { error } => {
+            Message::Text(json!({"t": "closed", "error": error}).to_string().into())
+        }
     }
 }

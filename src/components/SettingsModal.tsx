@@ -196,42 +196,19 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
               </div>
 
               <div className="field">
-                <label>guacd binary path</label>
-                <input type="text" value={s.settings.guacdPath} onChange={(e) => store.updateSettings({ guacdPath: e.target.value })} placeholder="Auto-detect (leave blank)" />
-                <div className="help">
-                  trdc auto-launches a guacamole-server <code>guacd</code> on 127.0.0.1. Leave blank to search
-                  common locations, or point it at your own build.
-                </div>
-              </div>
-
-              <div className="field">
-                <label>Engine status</label>
-                <div className={'test-result ' + (s.guacd.running ? 'ok' : 'fail')}>
-                  {s.guacd.running ? (
-                    <>
-                      Running on 127.0.0.1:{s.guacd.port}
-                      <div style={{ marginTop: 4, fontFamily: 'var(--mono)', fontSize: 10.5, opacity: 0.8 }}>{s.guacd.binary}</div>
-                    </>
+                <label>RDP engine</label>
+                <div className={'test-result ' + (s.bridgeWsPort ? 'ok' : 'fail')}>
+                  {s.bridgeWsPort ? (
+                    <>Built in — FreeRDP runs inside trdc (no sidecar process)</>
                   ) : (
-                    <>Offline — {s.guacd.detail}</>
+                    <>Starting up…</>
                   )}
                 </div>
-                <div className="row" style={{ marginTop: 8 }}>
-                  <button className="btn" onClick={() => void store.ensureGuacd()} disabled={s.guacd.running}>
-                    Start engine
-                  </button>
-                  <button className="btn danger" onClick={() => void import('../lib/tauri').then((m) => m.stopGuacd().then(() => store.init()))} disabled={!s.guacd.running}>
-                    Stop engine
-                  </button>
-                </div>
-              </div>
-
-              <div className="field">
-                <label>WebSocket bridge</label>
-                <div className="help" style={{ fontSize: 12 }}>
-                  The app talks to the engine through a local WebSocket bridge on port{' '}
-                  <span className="kbd">{s.bridgeWsPort || '—'}</span>. Sessions are proxied to guacd over
-                  TCP; nothing leaves this machine except the AI requests you configure.
+                <div className="help">
+                  trdc links FreeRDP 3 directly; sessions open from this window over a loopback
+                  WebSocket bridge on port <span className="kbd">{s.bridgeWsPort || '—'}</span>.
+                  Certificates are accepted as-is for now — per-host certificate pinning is on the
+                  roadmap. Nothing leaves this machine except the AI requests you configure.
                 </div>
               </div>
             </>

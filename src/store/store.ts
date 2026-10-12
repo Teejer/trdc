@@ -6,7 +6,7 @@
  * it through the hooks at the bottom (useSyncExternalStore); imperative code
  * (the AI tool executor, event handlers) calls its methods directly.
  */
-import { GuacSession } from '../guac/GuacSession';
+import { NativeSession } from '../native/NativeSession';
 import { DEFAULT_SETTINGS, newId } from '../types';
 import type {
   AppSettings,
@@ -16,12 +16,9 @@ import type {
 } from '../types';
 import {
   bridgePort,
-  guacdStatus,
   readConfig,
-  startGuacd,
   writeConfig,
 } from '../lib/tauri';
-import type { GuacdStatus } from '../lib/tauri';
 import { runAgent, listModels } from '../ai/openai';
 import type { ChatMessage, ModelInfo } from '../ai/openai';
 import { createToolExecutor, SESSION_TOOLS } from '../ai/tools';
@@ -94,12 +91,11 @@ export class AppStore {
   tabs: TabState[] = [];
   activeTabId: string | null = null;
   conversations: Record<string, Conversation> = {};
-  guacd: GuacdStatus = { running: false, port: 0, binary: null, detail: 'not started' };
   bridgeWsPort = 0;
   /** Global "AI takes over input" master toggle, mirrors settings but live. */
   aiInputEnabled = true;
 
-  private sessions = new Map<string, GuacSession>();
+  private sessions = new Map<string, NativeSession>();
   private abortControllers = new Map<string, AbortController>();
   /** Resolve functions for tool calls waiting on Approve/Deny. */
   private approvalResolvers = new Map<string, (ok: boolean) => void>();
@@ -152,11 +148,6 @@ export class AppStore {
       this.bridgeWsPort = await bridgePort();
     } catch {
       this.bridgeWsPort = 0;
-    }
-    try {
-      this.guacd = await guacdStatus();
-    } catch {
-      /* ignore */
     }
     this.emit();
     })();
@@ -242,11 +233,8 @@ export class AppStore {
       return existing.id;
     }
 
-    // Ensure guacd is up before connecting.
-    await this.ensureGuacd();
-
     const id = newId();
-    const session = new GuacSession(profile, id);
+    const session = new NativeSession(profile, id);
     const tab: TabState = {
       id,
       profileId,
@@ -305,12 +293,12 @@ export class AppStore {
     return id;
   }
 
-  getSession(tabId: string | null): GuacSession | null {
+  getSession(tabId: string | null): NativeSession | null {
     if (!tabId) return null;
     return this.sessions.get(tabId) ?? null;
   }
 
-  getActiveSession(): GuacSession | null {
+  getActiveSession(): NativeSession | null {
     return this.getSession(this.activeTabId);
   }
 
@@ -360,7 +348,7 @@ export class AppStore {
     const session = this.sessions.get(tabId);
     session?.disconnect();
     this.sessions.delete(tabId);
-    const fresh = new GuacSession(session!.profile, tabId);
+    const fresh = new NativeSession(session!.profile, tabId);
     fresh.setFitEnabled(tab.fit);
     fresh.setDarkMode(tab.dark);
     fresh.callbacks = {
@@ -382,21 +370,7 @@ export class AppStore {
     this.sessions.set(tabId, fresh);
     tab.status = 'connecting';
     this.emit();
-    void this.ensureGuacd().then(() => fresh.connect(this.bridgeUrl()));
-  }
-
-  // ---- guacd -----------------------------------------------------------
-
-  async ensureGuacd(): Promise<void> {
-    if (this.guacd.running) return;
-    try {
-      this.guacd = await startGuacd(this.settings.guacdPath || undefined);
-      this.bridgeWsPort = await bridgePort();
-    } catch (e) {
-      // Surfaced in the settings UI; connection attempt will error too.
-      this.guacd = { ...this.guacd, running: false, detail: String(e) };
-    }
-    this.emit();
+    void fresh.connect(this.bridgeUrl());
   }
 
   // ---- AI --------------------------------------------------------------

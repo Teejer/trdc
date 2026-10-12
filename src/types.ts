@@ -43,7 +43,7 @@ export interface ProtocolField {
   placeholder?: string;
   help?: string;
   default?: string;
-  /** For select fields (mirrors guacd's own args list where useful). */
+  /** For select fields (mirrors the engine's open-message choices). */
   choices?: { value: string; label: string }[];
   /** Shown in the compact form; the rest live behind "Advanced". */
   advanced?: boolean;
@@ -79,7 +79,6 @@ export interface AiSettings {
 
 export interface AppSettings {
   ai: AiSettings;
-  guacdPath: string;
   sidebarWidth: number;
   aiPanelWidth: number;
   /** New sessions start with the dark-mode (invert) screen filter on. */
@@ -109,7 +108,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
     autoExecute: false,
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
   },
-  guacdPath: '',
   sidebarWidth: 250,
   aiPanelWidth: 360,
   darkModeDefault: false,

@@ -3,13 +3,13 @@
  * currently-active session, resolved lazily via the supplied provider so the
  * AI always targets whichever tab the user is looking at.
  */
-import type { GuacSession } from '../guac/GuacSession';
-import { keyNameToKeysym } from '../guac/GuacSession';
+import type { NativeSession } from '../native/NativeSession';
+import { keyNameToKeysym } from '../native/NativeSession';
 import type { AgentToolResult, ToolDefinition, ToolExecutor } from './openai';
 
 export interface ToolContext {
   /** The session the AI should act on, or null if none is connected. */
-  getActiveSession: () => GuacSession | null;
+  getActiveSession: () => NativeSession | null;
   /** Master switch from settings - when false, input tools are refused. */
   inputControlEnabled: () => boolean;
   /** Whether the attached model accepts images. */
@@ -237,7 +237,7 @@ function err(message: string): AgentToolResult {
   return { content: message, isError: true, summary: message };
 }
 
-function requireSession(ctx: ToolContext): GuacSession | AgentToolResult {
+function requireSession(ctx: ToolContext): NativeSession | AgentToolResult {
   const session = ctx.getActiveSession();
   if (!session) return err('No active session. Ask the user to open a connection first.');
   return session;
@@ -442,7 +442,15 @@ export function createToolExecutor(ctx: ToolContext): ToolExecutor {
       case 'clipboard_paste': {
         const text = String(args.text ?? '');
         if (!text) return err('Nothing to paste.');
-        s.sendClipboardText(text);
+        if (!s.sendClipboardText(text)) {
+          // The native engine has no clipboard channel yet; typing the text
+          // as keystrokes is slower but works the same for text inputs.
+          await s.typeText(text);
+          return {
+            content: 'Clipboard redirection is unavailable; the text was typed directly instead.',
+            summary: `typed ${text.length} chars (no clipboard)`,
+          };
+        }
         const autoPaste = args.autoPaste !== false;
         if (autoPaste) {
           await s.pressChord(args.mac ? ['super', 'v'] : ['ctrl', 'v']);

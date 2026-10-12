@@ -207,6 +207,16 @@ button { font-family: inherit; }
 .session-view { position: absolute; inset: 0; }
 .session-container { position: absolute; inset: 0; overflow: auto; display: flex; align-items: center; justify-content: center; }
 .session-container > div { position: relative; }
+/* NativeSession display: canvas + absolutely-positioned cursor sprite inside
+   a viewport box sized to the scaled canvas; the wrapper carries the
+   dark-mode CSS filter so both invert together. */
+.native-display { line-height: 0; }
+.native-viewport { position: relative; }
+.native-display canvas { display: block; }
+.native-cursor {
+  position: absolute; left: 0; top: 0; z-index: 5;
+  pointer-events: none; image-rendering: pixelated; user-select: none;
+}
 .ai-takeover {
   position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
   background: var(--purple); color: #0b0b0b; font-weight: 700; font-size: 11px;

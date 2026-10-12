@@ -6,7 +6,6 @@ import { SessionView } from './components/SessionView';
 import { AiPanel } from './components/AiPanel';
 import { SettingsModal } from './components/SettingsModal';
 import { ConnectionEditor } from './components/ConnectionEditor';
-import { listen } from '@tauri-apps/api/event';
 
 let autopenDone = false; // survive React StrictMode double-invoke
 
@@ -27,17 +26,6 @@ export default function App() {
     });
   }, []);
 
-  // Live guacd log lines -> console (helps debugging sidecar startup).
-  useEffect(() => {
-    const un = listen<string>('guacd-log', (e) => {
-      console.log('[guacd]', e.payload);
-      if (/ERROR/.test(e.payload)) void store.init();
-    });
-    return () => {
-      void un.then((f) => f());
-    };
-  }, []);
-
   // Allow child components to open settings via a DOM event.
   useEffect(() => {
     const handler = () => setSettingsOpen(true);
@@ -53,12 +41,16 @@ export default function App() {
         </span>
         <span className="spacer" />
         <button
-          className={'guacd-pill' + (s.guacd.running ? ' ok' : '')}
-          title={s.guacd.binary ? `${s.guacd.binary}\nport ${s.guacd.port}` : s.guacd.detail ?? ''}
+          className={'guacd-pill' + (s.bridgeWsPort ? ' ok' : '')}
+          title={
+            s.bridgeWsPort
+              ? `built-in RDP engine, session bridge on 127.0.0.1:${s.bridgeWsPort}`
+              : 'session bridge not up yet'
+          }
           onClick={() => setSettingsOpen(true)}
         >
           <span className="dot" />
-          {s.guacd.running ? `engine :${s.guacd.port}` : 'engine offline'}
+          {s.bridgeWsPort ? `engine :${s.bridgeWsPort}` : 'engine offline'}
         </button>
         <button className="btn ghost small" onClick={() => setSettingsOpen(true)}>
           ⚙ Settings

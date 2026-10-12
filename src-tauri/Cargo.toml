@@ -1,6 +1,6 @@
 [package]
 name = "trdc"
-version = "0.1.0"
+version = "0.2.0"
 description = "trdc - tabbed remote desktop client with an AI copilot"
 authors = ["teejer"]
 edition = "2021"
@@ -9,7 +9,16 @@ edition = "2021"
 name = "trdc_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# tauri's custom-protocol feature embeds the built frontend into the binary.
+# `tauri build` enables it automatically; plain `cargo build --release` (what
+# the AUR PKGBUILD runs) must pass --features custom-protocol explicitly, or
+# the app loads the dev URL localhost:1420 and dies with "Connection refused".
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
+cc = "1.8.0"
+pkg-config = "0.3.34"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
@@ -24,6 +33,7 @@ tokio-tungstenite = "0.29"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
 libc = { version = "0.2.190", features = ["std"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [profile.release]
 codegen-units = 1

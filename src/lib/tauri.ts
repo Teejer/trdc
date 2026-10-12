@@ -1,27 +1,8 @@
 /** Thin typed wrappers around the trdc Tauri commands. */
 import { invoke } from '@tauri-apps/api/core';
 
-export interface GuacdStatus {
-  running: boolean;
-  port: number;
-  binary: string | null;
-  detail: string | null;
-}
-
 export async function bridgePort(): Promise<number> {
   return invoke<number>('bridge_port');
-}
-
-export async function guacdStatus(): Promise<GuacdStatus> {
-  return invoke<GuacdStatus>('guacd_status');
-}
-
-export async function startGuacd(path?: string): Promise<GuacdStatus> {
-  return invoke<GuacdStatus>('start_guacd', { path: path ?? null });
-}
-
-export async function stopGuacd(): Promise<void> {
-  return invoke('stop_guacd');
 }
 
 export interface AiRequestOptions {
