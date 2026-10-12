@@ -14,6 +14,7 @@ import type {
   ConnectionProfile,
   SessionStatus,
 } from '../types';
+import { getProtocol } from '../protocols';
 import {
   bridgePort,
   readConfig,
@@ -95,6 +96,16 @@ export class AppStore {
   /** Global "AI takes over input" master toggle, mirrors settings but live. */
   aiInputEnabled = true;
 
+  /**
+   * Connect-time RDP passwords, keyed by profile id. Memory only by design:
+   * never serialized, and saveConnections() scrubs any legacy password out
+   * of the on-disk profiles. (AI API keys are different and do persist.)
+   */
+  passwords = new Map<string, string>();
+  /** Non-null while a connect-time password prompt is on screen. */
+  pendingPassword: { profileId: string; prompt: string } | null = null;
+  private passwordResolvers = new Map<string, (pw: string | null) => void>();
+
   private sessions = new Map<string, NativeSession>();
   private abortControllers = new Map<string, AbortController>();
   /** Resolve functions for tool calls waiting on Approve/Deny. */
@@ -141,7 +152,22 @@ export class AppStore {
         ai: { ...DEFAULT_SETTINGS.ai, ...(settings.ai ?? {}) },
       };
     }
-    if (Array.isArray(connections)) this.connections = connections;
+    if (Array.isArray(connections)) {
+      // Older versions could save the RDP password into the profile file.
+      // Move any such password into the in-memory map (so existing
+      // connections keep working this run) and re-persist the scrubbed
+      // list, getting the secret back off disk.
+      let scrubbed = false;
+      this.connections = connections.map((c) => {
+        const pw = c.params?.password;
+        if (typeof pw !== 'string' || !('password' in c.params)) return c;
+        scrubbed = true;
+        if (pw) this.passwords.set(c.id, pw);
+        const { password: _gone, ...rest } = c.params;
+        return { ...c, params: rest };
+      });
+      if (scrubbed) void this.saveConnections();
+    }
     this.aiInputEnabled = this.settings.ai.inputControlEnabled;
 
     try {
@@ -204,16 +230,63 @@ export class AppStore {
     const tab = this.tabs.find((t) => t.profileId === id);
     if (tab) this.closeSession(tab.id);
     this.connections = this.connections.filter((c) => c.id !== id);
+    this.passwords.delete(id);
     void this.saveConnections();
     this.emit();
   }
 
   private async saveConnections(): Promise<void> {
     try {
-      await writeConfig(CONNECTIONS_FILE, this.connections);
+      // Belt and braces: passwords must never reach the profile file, so
+      // strip the key from every profile before writing.
+      const clean = this.connections.map((c) => {
+        if (!c.params || !('password' in c.params)) return c;
+        const { password: _gone, ...rest } = c.params;
+        return { ...c, params: rest };
+      });
+      await writeConfig(CONNECTIONS_FILE, clean);
     } catch (e) {
       console.error('failed to save connections', e);
     }
+  }
+
+  // ---- connect-time passwords -------------------------------------------
+
+  /**
+   * The password to authenticate `profile` with, asking the user when the
+   * protocol prompts at connect time and nothing is cached in memory yet.
+   * Resolves null when the user cancels the prompt (the caller must then
+   * not connect); for protocols without prompts it resolves undefined.
+   */
+  private async askPassword(profile: ConnectionProfile): Promise<string | null | undefined> {
+    const proto = getProtocol(profile.protocol);
+    if (!proto?.passwordAtConnect) return undefined;
+    const mem = this.passwords.get(profile.id);
+    if (mem !== undefined) return mem;
+    return new Promise<string | null | undefined>((resolve) => {
+      this.passwordResolvers.set(profile.id, (pw) => {
+        if (pw !== null) this.passwords.set(profile.id, pw);
+        this.pendingPassword = null;
+        this.emit();
+        resolve(pw);
+      });
+      const params = profile.params ?? {};
+      const who = params.username ? `${params.username}@` : '';
+      this.pendingPassword = {
+        profileId: profile.id,
+        prompt: `Password for ${who}${profile.hostname}`,
+      };
+      this.emit();
+    });
+  }
+
+  /** Answer the on-screen password prompt (null = cancel). */
+  resolvePassword(pw: string | null): void {
+    const pending = this.pendingPassword;
+    if (!pending) return;
+    const resolve = this.passwordResolvers.get(pending.profileId);
+    this.passwordResolvers.delete(pending.profileId);
+    resolve?.(pw);
   }
 
   // ---- sessions / tabs -------------------------------------------------
@@ -233,8 +306,13 @@ export class AppStore {
       return existing.id;
     }
 
+    // Connect-time password (memory only). Cancel = no tab.
+    const pw = await this.askPassword(profile);
+    if (pw === null) return null;
+
     const id = newId();
     const session = new NativeSession(profile, id);
+    session.password = pw ?? '';
     const tab: TabState = {
       id,
       profileId,
@@ -370,7 +448,16 @@ export class AppStore {
     this.sessions.set(tabId, fresh);
     tab.status = 'connecting';
     this.emit();
-    void fresh.connect(this.bridgeUrl());
+    void this.askPassword(fresh.profile).then((pw) => {
+      if (pw === null) {
+        tab.status = 'error';
+        tab.error = 'password required';
+        this.emit();
+        return;
+      }
+      fresh.password = pw ?? '';
+      void fresh.connect(this.bridgeUrl());
+    });
   }
 
   // ---- AI --------------------------------------------------------------

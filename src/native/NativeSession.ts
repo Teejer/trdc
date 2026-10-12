@@ -101,6 +101,11 @@ export class NativeSession {
   private disconnecting = false;
 
   callbacks: SessionCallbacks = {};
+  /**
+   * Connect-time password, held in memory only (the store prompts for it;
+   * it is never part of profile.params on disk).
+   */
+  password = '';
 
   constructor(profile: ConnectionProfile, id: string) {
     this.profile = profile;
@@ -142,6 +147,8 @@ export class NativeSession {
     }
     // Merge any extra unknown params verbatim.
     Object.assign(msg, this.profile.params);
+    // The runtime password wins over anything (legacy) in params.
+    msg.password = this.password;
     return msg;
   }
 

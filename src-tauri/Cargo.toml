@@ -1,6 +1,6 @@
 [package]
 name = "trdc"
-version = "0.2.1"
+version = "0.2.2"
 description = "trdc - tabbed remote desktop client with an AI copilot"
 authors = ["teejer"]
 edition = "2021"
@@ -39,5 +39,6 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# No panic=abort: a panic in one session task should unwind inside its tokio
+# task (the runtime catches it), not take the whole GUI down with it.
 strip = true

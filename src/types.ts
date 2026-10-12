@@ -56,6 +56,12 @@ export interface ProtocolDef {
   defaultPort: number;
   /** Extra static guacamole parameters sent with every connection. */
   extraArgs?: Record<string, string>;
+  /**
+   * The password is asked at connect time and kept in memory only (never
+   * written to connections.json); the editor shows no password field for
+   * such protocols.
+   */
+  passwordAtConnect?: boolean;
   fields: ProtocolField[];
 }
 

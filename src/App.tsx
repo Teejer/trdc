@@ -6,6 +6,7 @@ import { SessionView } from './components/SessionView';
 import { AiPanel } from './components/AiPanel';
 import { SettingsModal } from './components/SettingsModal';
 import { ConnectionEditor } from './components/ConnectionEditor';
+import { PasswordPrompt } from './components/PasswordPrompt';
 
 let autopenDone = false; // survive React StrictMode double-invoke
 
@@ -82,6 +83,7 @@ export default function App() {
       </div>
 
       {settingsOpen && <SettingsModal onClose={() => setSettingsOpen(false)} />}
+      <PasswordPrompt />
       {editingId && (
         <ConnectionEditor
           profileId={editingId === '__new__' ? null : editingId}

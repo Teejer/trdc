@@ -49,10 +49,12 @@ const rdp: ProtocolDef = {
   label: 'RDP',
   accent: '#2f6feb',
   defaultPort: 3389,
+  // The password is prompted when you connect and lives only in memory for
+  // the app's lifetime; it is never written to connections.json.
+  passwordAtConnect: true,
   fields: [
     { name: 'port', label: 'Port', type: 'number', default: '3389' },
     { name: 'username', label: 'Username', type: 'text' },
-    { name: 'password', label: 'Password', type: 'password' },
     { name: 'domain', label: 'Domain', type: 'text' },
     { name: 'width', label: 'Desktop width', type: 'number', advanced: true, default: '1280',
       help: 'Requested remote screen size. Applied on reconnect.' },
