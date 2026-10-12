@@ -25,6 +25,12 @@
 typedef struct trdc_session {
     trdc_callbacks cb;
     freerdp *inst;
+    /* Guards inst against input-vs-teardown races: the input entry points
+     * (bridge thread) use the instance under this lock, and trdc_connect
+     * detaches it (inst = NULL) under the lock before freeing. Without it a
+     * mouse move racing a failed NLA handshake tail-jumps through the freed
+     * input vtable (SIGSEGV at 0x0, seen on core 332695). */
+    CRITICAL_SECTION lock;
     volatile int stop;
     int mouse_mask; /* Guacamole button mask state */
     rdpPointer pointer_proto; /* persistent pointer class prototype */
@@ -99,76 +105,100 @@ static BOOL trdc_desktop_resize(rdpContext *context) {
 /* Frame acknowledgement (RDP 8.1+ flow control) is handled by FreeRDP's own
  * gdi_surface_frame_marker once gdi_init has run, so we install no hook. */
 
-/* --------------------------------------------------------------- input -- */
+/* --------------------------------------------------------------- input --
+ * All four entry points run on the bridge thread while the event loop and
+ * the teardown live on the FreeRDP thread. Two hazards, two defenses:
+ *
+ * 1. As of 3.32 the rdpInput client callbacks are only installed during MCS
+ *    Connect Confirm (input_register_client_callbacks in connection.c):
+ *    input->MouseEvent is legitimately NULL while the NLA handshake is in
+ *    flight. The freerdp_input_send_* wrappers are IFCALLRESULT-based, so a
+ *    NULL callback drops the event — and they no-op until the connection is
+ *    ACTIVE anyway, which is the right semantics for input typed during
+ *    connect. Never call the vtable pointers directly (SIGSEGV at 0x0, see
+ *    core 332695/345892).
+ * 2. The lock makes the (inst == NULL) check authoritative against
+ *    teardown: once trdc_connect detaches the instance, in-flight input
+ *    either finished before the detach or returns after it. */
 
 void trdc_mouse(trdc_session *s, int x, int y, int mask) {
-    if (s->inst == NULL || s->inst->context == NULL)
-        return;
-    rdpInput *input = s->inst->context->input;
-    int old = s->mouse_mask;
-
-    if (mask == old && (mask & 0x18) == 0) {
-        input->MouseEvent(input, PTR_FLAGS_MOVE, x, y);
-        return;
-    }
-
-    int released = old & ~mask;
-    int pressed = ~old & mask;
-
-    /* Release buttons that just came up. */
-    if (released & 0x07) {
-        int flags = 0;
-        if (released & 0x01) flags |= PTR_FLAGS_BUTTON1;
-        if (released & 0x02) flags |= PTR_FLAGS_BUTTON3;
-        if (released & 0x04) flags |= PTR_FLAGS_BUTTON2;
-        input->MouseEvent(input, flags, x, y);
-    }
-
-    /* Move with current button state. */
+    EnterCriticalSection(&s->lock);
+    if (s->inst == NULL || s->inst->context == NULL || s->inst->context->input == NULL)
+        goto out;
     {
-        int flags = PTR_FLAGS_MOVE;
-        if (mask & 0x01) flags |= PTR_FLAGS_BUTTON1;
-        if (mask & 0x02) flags |= PTR_FLAGS_BUTTON3;
-        if (mask & 0x04) flags |= PTR_FLAGS_BUTTON2;
-        input->MouseEvent(input, flags, x, y);
+        rdpInput *input = s->inst->context->input;
+        int old = s->mouse_mask;
+
+        if (mask == old && (mask & 0x18) == 0) {
+            freerdp_input_send_mouse_event(input, PTR_FLAGS_MOVE, (UINT16)x, (UINT16)y);
+            goto out;
+        }
+
+        int released = old & ~mask;
+        int pressed = ~old & mask;
+
+        /* Release buttons that just came up. */
+        if (released & 0x07) {
+            int flags = 0;
+            if (released & 0x01) flags |= PTR_FLAGS_BUTTON1;
+            if (released & 0x02) flags |= PTR_FLAGS_BUTTON3;
+            if (released & 0x04) flags |= PTR_FLAGS_BUTTON2;
+            freerdp_input_send_mouse_event(input, (UINT16)flags, (UINT16)x, (UINT16)y);
+        }
+
+        /* Move with current button state. */
+        {
+            int flags = PTR_FLAGS_MOVE;
+            if (mask & 0x01) flags |= PTR_FLAGS_BUTTON1;
+            if (mask & 0x02) flags |= PTR_FLAGS_BUTTON3;
+            if (mask & 0x04) flags |= PTR_FLAGS_BUTTON2;
+            freerdp_input_send_mouse_event(input, (UINT16)flags, (UINT16)x, (UINT16)y);
+        }
+
+        /* Press buttons that just went down. */
+        if (pressed & 0x07) {
+            int flags = PTR_FLAGS_DOWN;
+            if (pressed & 0x01) flags |= PTR_FLAGS_BUTTON1;
+            if (pressed & 0x02) flags |= PTR_FLAGS_BUTTON3;
+            if (pressed & 0x04) flags |= PTR_FLAGS_BUTTON2;
+            freerdp_input_send_mouse_event(input, (UINT16)flags, (UINT16)x, (UINT16)y);
+        }
+
+        /* Wheel clicks (transient, not part of the held mask). */
+        if (pressed & 0x08)
+            freerdp_input_send_mouse_event(input, PTR_FLAGS_WHEEL | 0x78, (UINT16)x, (UINT16)y);
+        if (pressed & 0x10)
+            freerdp_input_send_mouse_event(input,
+                                           PTR_FLAGS_WHEEL | PTR_FLAGS_WHEEL_NEGATIVE | 0x88,
+                                           (UINT16)x, (UINT16)y);
+
+        s->mouse_mask = mask & 0x07;
     }
-
-    /* Press buttons that just went down. */
-    if (pressed & 0x07) {
-        int flags = PTR_FLAGS_DOWN;
-        if (pressed & 0x01) flags |= PTR_FLAGS_BUTTON1;
-        if (pressed & 0x02) flags |= PTR_FLAGS_BUTTON3;
-        if (pressed & 0x04) flags |= PTR_FLAGS_BUTTON2;
-        input->MouseEvent(input, flags, x, y);
-    }
-
-    /* Wheel clicks (transient, not part of the held mask). */
-    if (pressed & 0x08)
-        input->MouseEvent(input, PTR_FLAGS_WHEEL | 0x78, x, y);
-    if (pressed & 0x10)
-        input->MouseEvent(input, PTR_FLAGS_WHEEL | PTR_FLAGS_WHEEL_NEGATIVE | 0x88, x, y);
-
-    s->mouse_mask = mask & 0x07;
+out:
+    LeaveCriticalSection(&s->lock);
 }
 
 void trdc_key(trdc_session *s, int scancode, int flags, int down) {
-    if (s->inst == NULL || s->inst->context == NULL)
-        return;
-    s->inst->context->input->KeyboardEvent(
-        s->inst->context->input, (UINT16)(flags | (down ? KBD_FLAGS_DOWN : KBD_FLAGS_RELEASE)),
-        (UINT16)scancode);
+    EnterCriticalSection(&s->lock);
+    if (s->inst != NULL && s->inst->context != NULL && s->inst->context->input != NULL)
+        freerdp_input_send_keyboard_event(s->inst->context->input,
+                                          (UINT16)(flags | (down ? KBD_FLAGS_DOWN : KBD_FLAGS_RELEASE)),
+                                          (UINT8)scancode);
+    LeaveCriticalSection(&s->lock);
 }
 
 void trdc_unicode(trdc_session *s, unsigned codepoint) {
-    if (s->inst == NULL || s->inst->context == NULL)
-        return;
-    s->inst->context->input->UnicodeKeyboardEvent(s->inst->context->input, 0, (UINT16)codepoint);
+    EnterCriticalSection(&s->lock);
+    if (s->inst != NULL && s->inst->context != NULL && s->inst->context->input != NULL)
+        freerdp_input_send_unicode_keyboard_event(s->inst->context->input, 0, (UINT16)codepoint);
+    LeaveCriticalSection(&s->lock);
 }
 
 void trdc_kbd_sync(trdc_session *s, int flags) {
-    if (s->inst == NULL || s->inst->context == NULL)
-        return;
-    s->inst->context->input->SynchronizeEvent(s->inst->context->input, flags);
+    EnterCriticalSection(&s->lock);
+    if (s->inst != NULL && s->inst->context != NULL && s->inst->context->input != NULL)
+        freerdp_input_send_synchronize_event(s->inst->context->input, (UINT32)flags);
+    LeaveCriticalSection(&s->lock);
 }
 
 /* -------------------------------------------------------------- pointer --
@@ -310,6 +340,7 @@ trdc_session *trdc_session_new(trdc_callbacks cb) {
     if (s == NULL)
         return NULL;
     s->cb = cb;
+    InitializeCriticalSection(&s->lock);
     return s;
 }
 
@@ -321,11 +352,15 @@ int trdc_connect(trdc_session *s, const char *hostname, int port, const char *us
     s->inst = freerdp_new();
     if (s->inst == NULL) {
         snprintf(s->error, sizeof(s->error), "freerdp_new failed");
+        if (s->cb.on_disconnect)
+            s->cb.on_disconnect(s->cb.user, 1, s->error);
         return 1;
     }
     s->inst->ContextSize = sizeof(trdc_context);
     if (!freerdp_context_new(s->inst)) {
         snprintf(s->error, sizeof(s->error), "freerdp_context_new failed");
+        if (s->cb.on_disconnect)
+            s->cb.on_disconnect(s->cb.user, 1, s->error);
         goto fail_inst;
     }
     tctx_inst(s->inst)->session = s;
@@ -395,18 +430,48 @@ int trdc_connect(trdc_session *s, const char *hostname, int port, const char *us
     goto fail_ctx;
 
 fail_ctx:
+    /* Detach the instance under the lock *before* freeing: the Closed event
+     * above already let the webview keep sending input while we unwind, so
+     * a concurrent trdc_mouse must either finish against a live instance or
+     * observe NULL here — never dereference the freed context. */
+    EnterCriticalSection(&s->lock);
+    freerdp *inst = s->inst;
+    s->inst = NULL;
+    LeaveCriticalSection(&s->lock);
     /* gdi_init allocated context->gdi; freerdp_context_free does not free
      * it (NULL-safe, so fine when the connect failed before PostConnect). */
-    gdi_free(s->inst);
-    freerdp_context_free(s->inst);
+    gdi_free(inst);
+    freerdp_context_free(inst);
+    freerdp_free(inst);
+    return rc;
+
 fail_inst:
-    freerdp_free(s->inst);
+    EnterCriticalSection(&s->lock);
+    inst = s->inst;
     s->inst = NULL;
+    LeaveCriticalSection(&s->lock);
+    freerdp_free(inst);
     return rc;
 }
 
-void trdc_stop(trdc_session *s) { s->stop = 1; }
+void trdc_stop(trdc_session *s) {
+    s->stop = 1;
+    /* Interrupt a handshake still in flight (ConnectLayer/NLA waits run to
+     * 15+ s otherwise): this sets FreeRDP's abort event, which the connect
+     * state machines poll, so the event loop and our join() return promptly.
+     * Under the lock so a teardown racing this cannot free the context we
+     * touch. */
+    EnterCriticalSection(&s->lock);
+    if (s->inst != NULL && s->inst->context != NULL)
+        freerdp_abort_connect_context(s->inst->context);
+    LeaveCriticalSection(&s->lock);
+}
 
 const char *trdc_session_error(trdc_session *s) { return s->error; }
 
-void trdc_session_free(trdc_session *s) { free(s); }
+void trdc_session_free(trdc_session *s) {
+    /* Only ever called after the FreeRDP thread was joined, so no input
+     * call can be waiting on the lock. */
+    DeleteCriticalSection(&s->lock);
+    free(s);
+}
