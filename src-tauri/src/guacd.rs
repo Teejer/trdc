@@ -183,6 +183,21 @@ pub fn start(
         .stdin(Stdio::null())
         .stdout(Stdio::null());
 
+    // If trdc dies abruptly (panic, SIGKILL, OOM), the kernel kills guacd
+    // too — without this the sidecar outlives a crashed parent forever.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        // (pre_exec itself is an unsafe API: the child runs this between
+        // fork and exec.)
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
     // Pipe stderr and forward interesting lines to the UI as events.
     command.stderr(Stdio::piped());
     for (k, v) in &envs {
