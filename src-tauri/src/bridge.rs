@@ -73,7 +73,15 @@ fn get_str(v: &Value, key: &str) -> String {
 }
 
 fn get_u32(v: &Value, key: &str, default: u32) -> u32 {
-    v.get(key).and_then(|x| x.as_u64()).map(|x| x as u32).unwrap_or(default)
+    // Connection-editor params arrive as strings ("1920"); the probe and
+    // any hand-written open message may use JSON numbers. Accept both.
+    v.get(key)
+        .and_then(|x| {
+            x.as_u64()
+                .or_else(|| x.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        })
+        .map(|x| x as u32)
+        .unwrap_or(default)
 }
 
 fn parse_open(v: &Value) -> Result<ConnectParams, String> {
