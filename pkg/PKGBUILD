@@ -1,5 +1,5 @@
 # Maintainer: TJ Griffiths <teej.d.man@gmail.com>
-# trdc: remote desktop client with a built-in AI copilot — connection tabs,
+# trdc: remote desktop client with a built-in AI assistant — connection tabs,
 # connection sidebar, and an AI panel that can see the remote screen and
 # (with per-action approval) drive its mouse and keyboard.
 #
@@ -9,7 +9,7 @@
 pkgname=trdc
 pkgver=0.2.3
 pkgrel=1
-pkgdesc="Remote desktop client with a built-in AI copilot (native FreeRDP RDP client)"
+pkgdesc="Remote desktop client with a built-in AI assistant (native FreeRDP RDP client)"
 arch=('x86_64')
 url="https://github.com/Teejer/trdc"
 license=('GPL-2.0-or-later')
@@ -53,7 +53,7 @@ package() {
 Type=Application
 Name=trdc
 GenericName=Remote desktop client
-Comment=Remote desktop client with a built-in AI copilot
+Comment=Remote desktop client with a built-in AI assistant
 Exec=trdc %u
 Terminal=false
 Categories=Network;RemoteAccess;

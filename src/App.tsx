@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useStore, store } from './store/hooks';
 import { Sidebar } from './components/Sidebar';
 import { TabBar } from './components/TabBar';
@@ -9,6 +10,16 @@ import { ConnectionEditor } from './components/ConnectionEditor';
 import { PasswordPrompt } from './components/PasswordPrompt';
 
 let autopenDone = false; // survive React StrictMode double-invoke
+
+/** Fire a window-control call; ignore failures when not running under
+ *  Tauri (e.g. the vite dev URL opened in a plain browser). */
+function winCtrl(fn: (w: ReturnType<typeof getCurrentWindow>) => Promise<unknown>): void {
+  try {
+    void fn(getCurrentWindow()).catch(() => undefined);
+  } catch {
+    /* no Tauri internals in this environment */
+  }
+}
 
 export default function App() {
   const s = useStore();
@@ -36,9 +47,13 @@ export default function App() {
 
   return (
     <div className="app">
-      <div className="titlebar" data-tauri-drag-region>
+      {/* "deep": the whole subtree drags (a bare attribute only drags when
+          the click lands on this exact element, and the flex spacer covers
+          most of the bar). Tauri's drag script still refuses to drag when
+          the click target is a button/link, so the controls work. */}
+      <div className="titlebar" data-tauri-drag-region="deep">
         <span className="brand">
-          trdc<small>tabbed remote desktop · AI copilot</small>
+          trdc<small>tabbed remote desktop · AI assistant</small>
         </span>
         <span className="spacer" />
         <button
@@ -56,6 +71,25 @@ export default function App() {
         <button className="btn ghost small" onClick={() => setSettingsOpen(true)}>
           ⚙ Settings
         </button>
+        {/* Client-side decorations: the OS titlebar is off (tauri.conf),
+            this bar is the titlebar (data-tauri-drag-region above), these
+            are its window buttons. tao hit-tests the window edges itself,
+            so resizing still works without an OS titlebar. */}
+        <span className="win-controls">
+          <button className="winbtn" title="Minimize" onClick={() => winCtrl((w) => w.minimize())}>
+            ─
+          </button>
+          <button
+            className="winbtn"
+            title="Maximize / restore"
+            onClick={() => winCtrl((w) => w.toggleMaximize())}
+          >
+            ▢
+          </button>
+          <button className="winbtn close" title="Close" onClick={() => winCtrl((w) => w.close())}>
+            ✕
+          </button>
+        </span>
       </div>
 
       <TabBar />
@@ -71,7 +105,7 @@ export default function App() {
               <p>
                 Pick a connection on the left to open a tab, or create a new one.
                 <br />
-                The AI copilot on the right can see the screen and drive the mouse & keyboard.
+                The AI assistant on the right can see the screen and drive the mouse & keyboard.
               </p>
               <button className="btn" onClick={() => setEditingId('__new__')}>
                 + New connection

@@ -17,5 +17,15 @@ fn main() {
     if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
         std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
     }
+    // Window controls need X11 semantics. GTK3 (webkit2gtk-4.1) on the
+    // native Wayland backend silently no-ops gtk_window_begin_move_drag
+    // and gtk_window_iconify — the custom client-side titlebar could not
+    // be dragged, minimized, or maximized there (verified: tao sends
+    // exactly those calls). X11 is fully implemented everywhere, and on a
+    // Wayland session this lands in XWayland, which compositors manage
+    // perfectly. Same compatibility trick Electron takes.
+    if std::env::var_os("GDK_BACKEND").is_none() {
+        std::env::set_var("GDK_BACKEND", "x11");
+    }
     trdc_lib::run()
 }

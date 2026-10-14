@@ -28,7 +28,7 @@ export function AiPanel() {
   return (
     <div className="aipanel" style={{ width: s.settings.aiPanelWidth }}>
       <div className="aipanel-header">
-        <h2>🤖 AI copilot</h2>
+        <h2>🤖 AI assistant</h2>
         <span
           className="model-chip"
           title={ai.model || 'No model selected — open settings'}
@@ -43,14 +43,14 @@ export function AiPanel() {
 
       {!tabId && (
         <div className="chat-empty">
-          Open a connection tab and the copilot can look at the screen and drive the mouse &
+          Open a connection tab and the assistant can look at the screen and drive the mouse &
           keyboard for you.
         </div>
       )}
 
       {tabId && !configured && (
         <div className="chat-empty">
-          <p>Point the copilot at an OpenAI-compatible backend to get started.</p>
+          <p>Point the assistant at an OpenAI-compatible backend to get started.</p>
           <button
             className="btn"
             onClick={() => window.dispatchEvent(new CustomEvent('trdc:open-settings'))}
@@ -65,7 +65,7 @@ export function AiPanel() {
           <div className="chat-scroll" ref={scrollRef}>
             {(!conv || (conv.messages.length === 0 && conv.activity.length === 0 && !conv.streaming)) && (
               <div className="chat-empty">
-                Ask the copilot to open an app, fill a form, or explain what's on screen.
+                Ask the assistant to open an app, fill a form, or explain what's on screen.
                 <br />
                 <span className="muted">
                   It acts on the active tab. A purple badge appears while it has the mouse.
@@ -139,7 +139,7 @@ export function AiPanel() {
           <div className="chat-input">
             <textarea
               rows={1}
-              placeholder={ai.model ? 'Ask the copilot… (Enter to send)' : 'Pick a model in settings first'}
+              placeholder={ai.model ? 'Ask the assistant… (Enter to send)' : 'Pick a model in settings first'}
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {

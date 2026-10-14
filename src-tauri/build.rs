@@ -6,6 +6,14 @@
 //! plain C types, so we need no bindgen/libclang.
 
 fn main() {
+    // The standard tauri build step: validates tauri.conf.json, parses
+    // capabilities/*.json into $OUT_DIR/capabilities.json (which
+    // generate_context! embeds as the runtime ACL), and emits the right
+    // rerun-if-changed lines. Without this call the macro silently embeds
+    // whatever stale capabilities snapshot the OUT_DIR happens to hold —
+    // capability edits never reach the binary ("not allowed by ACL").
+    tauri_build::build();
+
     let cfg = pkg_config::Config::new();
     let mut includes = Vec::new();
     for lib in ["freerdp3", "winpr3"] {

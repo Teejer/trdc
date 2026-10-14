@@ -70,6 +70,21 @@ button { font-family: inherit; }
 .guacd-pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--red); }
 .guacd-pill.ok .dot { background: var(--green); }
 
+/* Window buttons for the client-side titlebar (decorations are off; this
+   bar is the titlebar). Flush right, full height, like an Adwaita/KDE CSD
+   cluster. drag.js never starts a window drag from a <button>. */
+.win-controls {
+  display: inline-flex; align-items: stretch;
+  margin: 0 -12px 0 4px; height: 100%;
+}
+.winbtn {
+  width: 38px; border: none; background: transparent;
+  color: var(--text-dim); font-size: 13px; line-height: 1;
+  border-radius: 0; cursor: default;
+}
+.winbtn:hover { background: var(--bg-elev2); color: var(--text); }
+.winbtn.close:hover { background: #c0392b; color: #fff; }
+
 /* ---- tab bar ---------------------------------------------------------- */
 .tabbar {
   display: flex;

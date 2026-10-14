@@ -1,6 +1,6 @@
 [package]
 name = "trdc"
-version = "0.2.3"
+version = "0.2.4"
 description = "trdc - tabbed remote desktop client with an AI copilot"
 authors = ["teejer"]
 edition = "2021"
