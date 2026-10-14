@@ -189,7 +189,8 @@ const HOTKEY: ToolDefinition = {
     name: 'hotkey',
     description:
       'Press a keyboard shortcut given as one string, modifiers first, joined with "+": ' +
-      '"ctrl+a", "ctrl+shift+esc", "win+e", "alt+tab". Use this for any combination.',
+      '"ctrl+a", "ctrl+shift+esc", "win+e", "alt+tab". Use this for any combination. ' +
+      '"ctrl+alt+delete" wakes a locked Windows host (the lock screen ignores all other keys).',
     parameters: {
       type: 'object',
       properties: {

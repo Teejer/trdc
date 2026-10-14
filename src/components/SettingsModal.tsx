@@ -160,6 +160,14 @@ export function SettingsModal({ onClose }: { onClose: () => void }) {
                 <label>Attach screenshots automatically</label>
                 <input type="checkbox" checked={ai.autoScreenshot} onChange={(e) => set({ autoScreenshot: e.target.checked })} />
               </div>
+              <div className="field-inline" title="trdc guesses whether your model can see images from its name. Local or quantized models often need “Yes” set by hand; “No” hides the screenshot tool entirely.">
+                <label>Model can see screenshots</label>
+                <select value={ai.vision} onChange={(e) => set({ vision: e.target.value as 'auto' | 'yes' | 'no' })}>
+                  <option value="auto">Auto-detect</option>
+                  <option value="yes">Yes</option>
+                  <option value="no">No</option>
+                </select>
+              </div>
               <div className="field-inline">
                 <label>Auto-execute actions (skip approvals)</label>
                 <input type="checkbox" checked={ai.autoExecute} onChange={(e) => set({ autoExecute: e.target.checked })} />

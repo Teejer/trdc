@@ -78,6 +78,13 @@ export function SessionView({ tabId }: { tabId: string }) {
         </button>
         <button
           className="btn secondary small"
+          onClick={() => session?.sendCtrlAltDel()}
+          title="Send Ctrl+Alt+Del to the remote host (wakes the Windows lock screen)"
+        >
+          ⌨ Ctrl+Alt+Del
+        </button>
+        <button
+          className="btn secondary small"
           onClick={() => store.setDark(tab.id, !tab.dark)}
           title={
             tab.dark

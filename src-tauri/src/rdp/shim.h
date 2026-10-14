@@ -83,6 +83,12 @@ void trdc_unicode(trdc_session *s, unsigned codepoint);
 /* Keyboard lock synchronization (KBD_SYNC_* flags). */
 void trdc_kbd_sync(trdc_session *s, int flags);
 
+/* Live desktop resolution change. Currently inert: the legacy Monitor
+ * Layout PDU is only legal during capabilities exchange, and sending it
+ * mid-session resets Windows RDP connections. Real live resize needs the
+ * disp DVC channel. Always returns 0. */
+int trdc_resize(trdc_session *s, int width, int height);
+
 #ifdef __cplusplus
 }
 #endif

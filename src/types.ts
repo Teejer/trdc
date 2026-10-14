@@ -76,6 +76,13 @@ export interface AiSettings {
   /** Master switch for AI mouse/keyboard control. */
   inputControlEnabled: boolean;
   /**
+   * Whether the selected model accepts screenshot images. auto = guess from
+   * the model name (heuristic; local/quant names often fool it). yes/no
+   * override the guess — set "yes" when your model really can see images
+   * but trdc refuses to send screenshots.
+   */
+  vision: 'auto' | 'yes' | 'no';
+  /**
    * Run ordinary action tools (clicks, typing) without asking. Dangerous
    * calls (destructive commands, lock/logout chords) ALWAYS ask.
    */
@@ -111,6 +118,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
     maxToolRounds: 12,
     autoScreenshot: true,
     inputControlEnabled: true,
+    vision: 'auto',
     autoExecute: false,
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
   },

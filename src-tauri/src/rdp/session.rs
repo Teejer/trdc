@@ -96,8 +96,7 @@ impl Surface {
 
     /// Take the pending damage, encoding the region to JPEG. Returns None
     /// when there is nothing to send. Runs off the FreeRDP thread.
-    fn take_frame(&mut self) -> Option<ServerEvent> {
-        let region = if self.full {
+    fn take_frame(&mut self) -> Option<ServerEvent> {        let region = if self.full {
             if self.width == 0 || self.height == 0 {
                 return None;
             }
@@ -125,6 +124,24 @@ impl Surface {
             let mut enc = JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY);
             if enc.encode(&rgb, w, h, ExtendedColorType::Rgb8).is_err() {
                 return None;
+            }
+        }
+        // TRDC_RDP_DEBUG: dump the first encoded tiles plus a rolling
+        // "latest" dump, so we can inspect whether the black screen is
+        // already black here (=> FreeRDP's GDI buffer) or only after the
+        // webview draws it.
+        if std::env::var("TRDC_RDP_DEBUG").is_ok() {
+            static FRAMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = FRAMES.fetch_add(1, Ordering::Relaxed);
+            if n < 8 || n % 200 == 199 {
+                let nonzero = rgb.iter().take(65536).filter(|b| **b != 0).count();
+                eprintln!(
+                    "[trdc-dbg] take_frame #{n} {w}x{h} jpeg={}B rgb[0..6]={:02x?} nonzero/64k={nonzero}",
+                    out.len(),
+                    &rgb[..6.min(rgb.len())]
+                );
+                let name = if n < 8 { format!("tile-{n}.jpg") } else { "tile-last.jpg".into() };
+                let _ = std::fs::write(std::env::temp_dir().join(name), &out);
             }
         }
         Some(ServerEvent::Frame { x, y, w, h, data: out })
@@ -400,20 +417,36 @@ impl RunningSession {
     /// shared surface while the session is running.
     pub fn start_ticker(&self) {
         let shared = unsafe { &*self.holder }.shared.clone();
+        let dbg = std::env::var("TRDC_RDP_DEBUG").is_ok();
         std::thread::spawn(move || {
+            let mut ticks = 0u64;
+            let mut sent = 0u64;
             while shared.running.load(Ordering::Relaxed) {
                 std::thread::sleep(TICK);
+                ticks += 1;
                 let frame = shared.surface.lock().ok().and_then(|mut s| s.take_frame());
                 if let Some(f) = frame {
+                    sent += 1;
+                    if dbg && sent <= 3 {
+                        eprintln!("[trdc-dbg] ticker sent frame #{sent}");
+                    }
                     if shared.events.send(f).is_err() {
+                        if dbg {
+                            eprintln!("[trdc-dbg] ticker: events channel closed after {sent} frames");
+                        }
                         break; // webview gone; the bridge will stop us
                     }
+                } else if dbg && ticks % 250 == 0 {
+                    eprintln!("[trdc-dbg] ticker tick {ticks}: no frame (sent={sent})");
                 }
+            }
+            if dbg {
+                eprintln!("[trdc-dbg] ticker exiting: ticks={ticks} sent={sent}");
             }
         });
     }
 
-    fn live(&self) -> bool {
+    pub fn live(&self) -> bool {
         unsafe { &*self.holder }.shared.running.load(Ordering::Relaxed)
     }
 
@@ -422,6 +455,16 @@ impl RunningSession {
         if self.live() {
             unsafe { trdc_mouse(self.session.0, x, y, mask) };
         }
+    }
+
+    /// Ask the server to change the desktop resolution live (monitor layout
+    /// PDU). Returns true when the request went out; the actual resize (if
+    /// the server agrees) arrives as a `ServerEvent::Resized`.
+    pub fn resize(&self, width: i32, height: i32) -> bool {
+        if !self.live() {
+            return false;
+        }
+        unsafe { trdc_resize(self.session.0, width, height) == 1 }
     }
 
     /// Press/release an X11 keysym through the layout engine.

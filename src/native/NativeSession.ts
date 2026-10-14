@@ -33,6 +33,8 @@ const NAMED_KEYS: Record<string, number> = {
   // often gets swallowed; krdc-ai learned this the hard way).
   backtab: 0xfe20, shifttab: 0xfe20,
   pageup: 0xff55, prior: 0xff55, pagedown: 0xff56, next: 0xff56,
+  home: 0xff50, end: 0xff57, insert: 0xff63,
+  delete: 0xffff, del: 0xffff, backspace: 0xff08,
   up: 0xff52, down: 0xff54, left: 0xff51, right: 0xff53,
   win: 0xffeb, super: 0xffeb, meta: 0xffeb, cmd: 0xffeb,
   ctrl: 0xffe3, control: 0xffe3, shift: 0xffe1, alt: 0xffe9, option: 0xffe9,
@@ -82,13 +84,17 @@ export class NativeSession {
   private viewport: HTMLElement | null = null;
   private canvas: HTMLCanvasElement | null = null;
   private ctx: CanvasRenderingContext2D | null = null;
-  private cursorImg: HTMLImageElement | null = null;
-  private cursorUrl: string | null = null;
   private keyboard: any = null;
   private resizeObserver: ResizeObserver | null = null;
 
   /** Serializes tile draws so out-of-order JPEG decodes land in send order. */
   private drawChain: Promise<void> = Promise.resolve();
+  /** Received screen tiles (kind 1), for TRDC_RDP_DEBUG reporting. */
+  private tilesIn = 0;
+  /** Echo a line to the trdc process stderr (debug builds only). */
+  private debug(msg: string): void {
+    this.send({ t: 'debug', msg: `${this.id.slice(0, 4)} ${msg}` });
+  }
   /** Human pointer button mask, live. */
   private humanMask = 0;
   private status: SessionStatus = 'connecting';
@@ -147,10 +153,59 @@ export class NativeSession {
     }
     // Merge any extra unknown params verbatim.
     Object.assign(msg, this.profile.params);
+    // No explicit desktop size in the profile? Start the remote desktop at
+    // the middle pane's pixel size so Fit mode is 1:1 sharp from frame one
+    // (and later pane changes resize the desktop live, see requestResize).
+    if (!this.sizePinned()) {
+      const pane = this.paneSize();
+      msg.width = pane.width;
+      msg.height = pane.height;
+    }
     // The runtime password wins over anything (legacy) in params.
     msg.password = this.password;
     return msg;
   }
+
+  /** True when the profile pins an explicit desktop width/height. */
+  private sizePinned(): boolean {
+    return (
+      this.profile.params.width !== undefined &&
+      this.profile.params.width !== '' &&
+      this.profile.params.height !== undefined &&
+      this.profile.params.height !== ''
+    );
+  }
+
+  /**
+   * Middle pane size in remote device pixels (CSS px x devicePixelRatio),
+   * rounded to even (encoders prefer it) and clamped to what Windows RDP
+   * accepts. Falls back to a window-based estimate when the pane has not
+   * been attached yet (connect races mount).
+   */
+  private paneSize(): { width: number; height: number } {
+    let cw = 0;
+    let ch = 0;
+    if (this.container) {
+      cw = this.container.clientWidth;
+      ch = this.container.clientHeight;
+    }
+    if (!cw || !ch) {
+      // Titlebar + tab bar + toolbar + sidebar + AI panel, roughly.
+      cw = Math.max(640, window.innerWidth - 460);
+      ch = Math.max(480, window.innerHeight - 120);
+    }
+    const dpr = window.devicePixelRatio || 1;
+    const even = (v: number, lo: number, hi: number) =>
+      Math.min(hi, Math.max(lo, Math.round((v * dpr) / 2) * 2));
+    return { width: even(cw, 800, 3840), height: even(ch, 600, 2160) };
+  }
+
+  /* Live resolution change while connected is deliberately NOT attempted:
+   * the legacy Monitor Layout PDU mid-session is a protocol violation that
+   * resets Windows RDP connections (observed: transport reset + wedged
+   * listener on two hosts). Real live resize needs the MS-RDPEDYC disp DVC
+   * channel, which the shim does not load; until then pane changes are
+   * Fit-scaled and a true resolution change is a reconnect. */
 
   /** Connect using the given bridge WebSocket URL. */
   connect(bridgeUrl: string): Promise<void> {
@@ -162,7 +217,13 @@ export class NativeSession {
       this.ws = ws;
       let settled = false;
 
-      ws.onopen = () => ws.send(JSON.stringify(this.buildOpenMessage()));
+      ws.onopen = () => {
+        ws.send(JSON.stringify(this.buildOpenMessage()));
+        // One-shot credential: the Rust bridge has it for the handshake and
+        // nothing in the webview needs it again. Drop our copy immediately
+        // so no live session object holds a plaintext password.
+        this.password = '';
+      };
       ws.onmessage = (ev: MessageEvent) => {
         if (typeof ev.data === 'string') {
           let msg: any;
@@ -173,16 +234,21 @@ export class NativeSession {
           }
           if (msg.t === 'ready' && !settled) {
             settled = true;
+            this.debug(`ready ${msg.width}x${msg.height} createImageBitmap=${typeof createImageBitmap}`);
             this.setStatus('connected');
+            this.setRemoteSize(msg.width, msg.height);
             this.callbacks.onSize?.(msg.width, msg.height);
             this.applyScale();
             resolve();
           } else if (msg.t === 'resize') {
             this.handleResize(msg.width, msg.height);
           } else if (msg.t === 'cursor-pos') {
-            this.moveCursorSprite(msg.x, msg.y);
+            // The CSS cursor rides the real mouse; a server-side position
+            // PDU needs no action here.
           } else if (msg.t === 'cursor-hide') {
-            if (this.cursorImg) this.cursorImg.style.display = 'none';
+            // Server hid its pointer; show the local cursor again so the
+            // user is never pointer-blind.
+            if (this.wrapper) this.wrapper.style.cursor = 'default';
           } else if (msg.t === 'system-cursor') {
             this.applySystemCursor(msg.name);
           } else if (msg.t === 'closed') {
@@ -210,33 +276,72 @@ export class NativeSession {
     });
   }
 
+  /**
+   * Remote display size as announced by the server (ready/resize). The
+   * canvas is created lazily in attach(), which can run before OR after
+   * the ready message, so the size has to live on the session, not the
+   * canvas: sizing the canvas from the canvas (screenSize) before the
+   * first frame used to leave a permanent 1x1 canvas that swallowed every
+   * tile and crushed mouse coordinates to (0,0).
+   */
+  private remoteW = 0;
+  private remoteH = 0;
+  private setRemoteSize(width: number, height: number): void {
+    if (!width || !height) return;
+    this.remoteW = width;
+    this.remoteH = height;
+    if (this.canvas && (this.canvas.width !== width || this.canvas.height !== height)) {
+      this.canvas.width = width;
+      this.canvas.height = height;
+      this.ctx = this.canvas.getContext('2d', { alpha: false, willReadFrequently: true });
+    }
+  }
+
   /** Attach the display to a container and start handling human input. */
   attach(container: HTMLElement) {
     this.container = container;
+    this.buildDom();
+    if (this.wrapper && this.wrapper.parentElement !== container) {
+      container.appendChild(this.wrapper);
+    }
+
+    this.resizeObserver = new ResizeObserver(() => this.applyScale());
+    this.resizeObserver.observe(container);
+
+    this.applyScale();
+    this.applyDarkMode();
+  }
+
+  /**
+   * The display DOM (wrapper/viewport/canvas + input listeners) is built
+   * once per session and *kept* between attach/detach: switching tabs only
+   * removes it from the DOM. That preserves the last painted frame — the
+   * server sends dirty rectangles only, so a canvas rebuilt on every attach
+   * would show black until the remote host happened to repaint. It also
+   * stops re-adding window keyboard listeners on every tab switch.
+   */
+  private buildDom(): void {
+    if (this.wrapper) return;
 
     const wrapper = document.createElement('div');
     wrapper.className = 'native-display';
-    // Inner box sized exactly to the (scaled) canvas so the cursor sprite's
-    // left/top map 1:1 to remote pixels; the wrapper flex-centers it.
+    // Inner box sized exactly to the (scaled) canvas.
     const viewport = document.createElement('div');
     viewport.className = 'native-viewport';
     const canvas = document.createElement('canvas');
-    canvas.width = Math.max(1, this.screenSize().width || 1);
-    canvas.height = Math.max(1, this.screenSize().height || 1);
-    const cursor = document.createElement('img');
-    cursor.className = 'native-cursor';
-    cursor.style.display = 'none';
-    cursor.draggable = false;
+    canvas.width = Math.max(1, this.remoteW);
+    canvas.height = Math.max(1, this.remoteH);
     viewport.appendChild(canvas);
-    viewport.appendChild(cursor);
     wrapper.appendChild(viewport);
-    container.appendChild(wrapper);
 
     this.wrapper = wrapper;
     this.viewport = viewport;
     this.canvas = canvas;
-    this.ctx = canvas.getContext('2d');
-    this.cursorImg = cursor;
+    // willReadFrequently keeps the canvas in a software backing store. On
+    // WebKitGTK's accelerated canvas, drawImage updates land in the backing
+    // store (getImageData sees them) but the GPU compositor keeps showing a
+    // stale texture — the remote screen visibly freezes on the first frame.
+    this.ctx = canvas.getContext('2d', { alpha: false, willReadFrequently: true });
 
     // Human pointer -> remote. Coordinates map through the canvas rect so
     // fit-scaling is transparent.
@@ -284,22 +389,32 @@ export class NativeSession {
     // Human keyboard -> remote (only while this session is focused/visible).
     const keyboard = new Guacamole.Keyboard(window);
     this.keyboard = keyboard;
+    // guac calls preventDefault whenever the handler returns false, so we
+    // must return TRUE for anything that isn't remote-bound typing: trdc's
+    // own inputs (settings modal, search box, chat) and unfocused sessions.
+    // Returning false everywhere used to make trdc's own text fields
+    // untypeable and leaked session keys to the remote host.
+    const editableTarget = () => {
+      const el = document.activeElement;
+      if (!el) return false;
+      const tag = el.tagName;
+      return (
+        tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' ||
+        (el as HTMLElement).isContentEditable
+      );
+    };
     keyboard.onkeydown = (keysym: number) => {
-      if (!this.isFocused()) return false;
+      if (!this.isFocused() || editableTarget()) return true;
       this.send({ t: 'key', keysym, down: 1 });
       return false;
     };
     keyboard.onkeyup = (keysym: number) => {
-      if (!this.isFocused()) return false;
+      if (!this.isFocused() || editableTarget()) return true;
       this.send({ t: 'key', keysym, down: 0 });
       return false;
     };
-
-    this.resizeObserver = new ResizeObserver(() => this.applyScale());
-    this.resizeObserver.observe(container);
-
-    this.applyScale();
-    this.applyDarkMode();
+    // (ResizeObserver + initial scaling happen in attach(): the observer
+    // watches the *container*, which only exists once we are mounted.)
   }
 
   detach() {
@@ -309,12 +424,10 @@ export class NativeSession {
     if (this.wrapper && this.container && this.wrapper.parentElement === this.container) {
       this.container.removeChild(this.wrapper);
     }
-    this.keyboard = null;
-    this.wrapper = null;
-    this.viewport = null;
-    this.canvas = null;
-    this.ctx = null;
-    this.cursorImg = null;
+    // The display DOM (and the last painted frame inside it) survives
+    // detach: buildDom() keeps it, attach() re-mounts it. Only the
+    // container binding goes away — isFocused() reads it through
+    // container?.isConnected, so a detached session stops sending input.
     this.container = null;
   }
 
@@ -333,6 +446,11 @@ export class NativeSession {
     this.applyScale();
   }
   private fit = true;
+
+  /** Fit mode never scrolls; 1:1 mode gets scrollbars for big screens. */
+  private applyOverflow() {
+    if (this.container) this.container.style.overflow = this.fit ? 'hidden' : 'auto';
+  }
 
   /**
    * Client-side "dark mode": the remote OS decides its own colors, so for
@@ -358,6 +476,7 @@ export class NativeSession {
 
   private applyScale() {
     if (!this.canvas || !this.container) return;
+    this.applyOverflow();
     const w = this.canvas.width;
     const h = this.canvas.height;
     if (!w || !h) return;
@@ -375,13 +494,8 @@ export class NativeSession {
       this.viewport.style.width = this.canvas.style.width;
       this.viewport.style.height = this.canvas.style.height;
     }
-    // Rescale the cursor sprite with the picture.
-    if (this.cursorImg && this.cursorImg.dataset.w) {
-      const cw = Number(this.cursorImg.dataset.w);
-      const chh = Number(this.cursorImg.dataset.h);
-      this.cursorImg.style.width = `${Math.round(cw * this.scale)}px`;
-      this.cursorImg.style.height = `${Math.round(chh * this.scale)}px`;
-    }
+    // The CSS cursor (installCursorShape) rides at its native size; the
+    // browser positions it, so there is nothing sprite-like to rescale.
   }
 
   // ---- wire handling ----------------------------------------------------
@@ -393,10 +507,8 @@ export class NativeSession {
   }
 
   private handleResize(width: number, height: number): void {
-    if (!this.canvas || !width || !height) return;
-    this.canvas.width = width;
-    this.canvas.height = height;
-    this.ctx = this.canvas.getContext('2d');
+    if (!width || !height) return;
+    this.setRemoteSize(width, height);
     this.callbacks.onSize?.(width, height);
     this.applyScale();
   }
@@ -405,10 +517,56 @@ export class NativeSession {
    * Binary server frames: [u8 kind][i32le x][i32le y][i32le w][i32le h][payload].
    * kind 1 = JPEG screen tile, kind 2 = PNG cursor shape (x/y = hotspot).
    */
+  /**
+   * Decode a tile image without ever wedging the draw chain: WebKitGTK's
+   * createImageBitmap has been observed to hand out promises that never
+   * settle for some JPEG blobs, which used to silently stop every later
+   * tile (cursor shapes ride a different path and kept working). Race each
+   * decode against a watchdog and fall back to an <img> decode, which uses
+   * WebKit's regular image pipeline.
+   */
+  async decodeImage(blob: Blob): Promise<HTMLImageElement | ImageBitmap | null> {
+    type Decoded = HTMLImageElement | ImageBitmap | null;
+    const useBitmap = !this.decodeWedge && typeof createImageBitmap === 'function';
+    if (useBitmap) {
+      const raced: ImageBitmap | 'wedged' | null = await Promise.race([
+        createImageBitmap(blob).catch(() => null),
+        new Promise<'wedged'>((resolve) => setTimeout(() => resolve('wedged'), 3000)),
+      ]);
+      if (raced && raced !== 'wedged') return raced as ImageBitmap;
+      if (raced === 'wedged') {
+        this.decodeWedge++;
+        this.debug(`decode watchdog fired (#${this.decodeWedge}) -> img fallback`);
+      }
+    }
+    // Fallback: classic object-URL <img> decode via WebKit's image pipeline.
+    const viaImg: Decoded = await new Promise((resolve) => {
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      const t = setTimeout(() => {
+        URL.revokeObjectURL(url);
+        resolve(null);
+      }, 4000);
+      img.onload = () => {
+        clearTimeout(t);
+        resolve(img);
+      };
+      img.onerror = () => {
+        clearTimeout(t);
+        URL.revokeObjectURL(url);
+        resolve(null);
+      };
+      img.src = url;
+    });
+    return viaImg;
+  }
+  private decodeWedge = 0;
+
   private handleBinary(buffer: ArrayBuffer): void {
     const view = new DataView(buffer);
     if (buffer.byteLength < 17) return;
     const kind = view.getUint8(0);
+    if (this.tilesIn === 0 && kind !== 1) this.debug(`bin kind=${kind} ${buffer.byteLength}B`);
     const x = view.getInt32(1, true);
     const y = view.getInt32(5, true);
     const w = view.getInt32(9, true);
@@ -417,37 +575,46 @@ export class NativeSession {
     if (kind === 1) {
       const mime = this.isPng(payload) ? 'image/png' : 'image/jpeg';
       const blob = new Blob([payload], { type: mime });
-      // Chain draws: createImageBitmap resolves asynchronously, and tiles
-      // must land in the order the server sent them.
+      const n = ++this.tilesIn;
+      if (n <= 8) this.debug(`tile #${n} ${w}x${h} ${payload.byteLength}B ${mime} ctx=${!!this.ctx}`);
+      // Chain draws: decodes resolve asynchronously, and tiles must land
+      // in the order the server sent them. decodeImage never wedges.
       this.drawChain = this.drawChain
         .then(async () => {
-          try {
-            const bmp = await createImageBitmap(blob);
-            this.ctx?.drawImage(bmp, x, y);
-            bmp.close();
-          } catch {
-            /* undecodable tile; the next frame boundary repaints over it */
+          const img = await this.decodeImage(blob);
+          if (!this.ctx || !this.canvas) {
+            if (n <= 8) this.debug(`tile no-ctx #${n}`);
+            if (img && 'close' in img) img.close();
+            return;
+          }
+          if (!img) {
+            this.debug(`tile FAILED #${n}: undecodable`);
+            return;
+          }
+          this.ctx.drawImage(img, x, y);
+          if ('close' in img) img.close();
+          // WebKitGTK non-standard: force the accelerated canvas to push its
+          // backing store to the compositor (without this, draws can stay
+          // invisible on some GPU paths).
+          (this.canvas as HTMLCanvasElement & { requestPaint?: () => void }).requestPaint?.();
+          if (n <= 8) {
+            const px = this.ctx.getImageData(
+              Math.min(x + (w >> 1), this.canvas.width - 1),
+              Math.min(y + (h >> 1), this.canvas.height - 1),
+              1,
+              1,
+            ).data;
+            this.debug(`tile drawn #${n} via ${'close' in img ? 'bitmap' : 'img'} px=(${px[0]},${px[1]},${px[2]},${px[3]})`);
           }
         })
         .catch(() => {});
     } else if (kind === 2) {
-      const blob = new Blob([payload], { type: 'image/png' });
-      if (this.cursorUrl) URL.revokeObjectURL(this.cursorUrl);
-      this.cursorUrl = URL.createObjectURL(blob);
-      const img = this.cursorImg;
-      if (img) {
-        img.src = this.cursorUrl;
-        img.dataset.w = String(w);
-        img.dataset.h = String(h);
-        img.dataset.hotx = String(x);
-        img.dataset.hoty = String(y);
-        img.style.width = `${Math.round(w * this.scale)}px`;
-        img.style.height = `${Math.round(h * this.scale)}px`;
-        img.style.display = '';
-        // The new shape becomes the visible cursor centered on the last
-        // known position; a cursor-pos PDU follows if the server moves it.
-        if (this.wrapper) this.wrapper.style.cursor = 'none';
-      }
+      // A cursor *shape* PDU: install it as a CSS cursor with a baked
+      // outline. Windows with cached pointers sends the shape once and
+      // stops sending positions — the client is expected to draw it at the
+      // local pointer position, which a CSS cursor does natively (perfect
+      // tracking, honoured hotspot, nothing to skip or vanish).
+      void this.installCursorShape(new Blob([payload], { type: 'image/png' }), x, y);
     }
   }
 
@@ -456,27 +623,72 @@ export class NativeSession {
     return v.length === 4 && v[0] === 0x89 && v[1] === 0x50;
   }
 
-  private moveCursorSprite(x: number, y: number): void {
-    const img = this.cursorImg;
-    if (!img || !this.wrapper) return;
-    const hotx = Number(img.dataset.hotx ?? 0);
-    const hoty = Number(img.dataset.hoty ?? 0);
-    img.style.left = `${Math.round((x - hotx) * this.scale)}px`;
-    img.style.top = `${Math.round((y - hoty) * this.scale)}px`;
-    img.style.display = '';
-    this.wrapper.style.cursor = 'none';
+  /**
+   * Bake a solid outline in the opposite luminance of the cursor's own
+   * pixels (white arrow -> black ring, black I-beam -> white ring) into a
+   * padded copy of the shape, then install it as the wrapper's CSS cursor.
+   */
+  private async installCursorShape(blob: Blob, hotx: number, hoty: number): Promise<void> {
+    try {
+      const bmp = await createImageBitmap(blob);
+      const pad = 2;
+      const c = document.createElement('canvas');
+      c.width = bmp.width + pad * 2;
+      c.height = bmp.height + pad * 2;
+      const ctx = c.getContext('2d', { willReadFrequently: true });
+      if (!ctx) {
+        if ('close' in bmp) bmp.close();
+        return;
+      }
+      ctx.drawImage(bmp, pad, pad);
+      // Mean luminance of the opaque pixels picks the ring color.
+      const d = ctx.getImageData(0, 0, c.width, c.height).data;
+      let sum = 0;
+      let n = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i + 3] > 128) {
+          sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+          n++;
+        }
+      }
+      const ring = n > 0 && sum / n <= 127 ? '255,255,255' : '0,0,0';
+      // Silhouette in the ring color, stamped in 8 directions around the
+      // shape = solid 1px outline that follows every contour.
+      const sil = document.createElement('canvas');
+      sil.width = c.width;
+      sil.height = c.height;
+      const sctx = sil.getContext('2d');
+      if (!sctx) {
+        if ('close' in bmp) bmp.close();
+        return;
+      }
+      sctx.drawImage(bmp, pad, pad);
+      sctx.globalCompositeOperation = 'source-in';
+      sctx.fillStyle = `rgb(${ring})`;
+      sctx.fillRect(0, 0, sil.width, sil.height);
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (const dx of [-1, 0, 1])
+        for (const dy of [-1, 0, 1]) if (dx || dy) ctx.drawImage(sil, dx, dy);
+      ctx.drawImage(bmp, pad, pad);
+      if ('close' in bmp) bmp.close();
+      const url = c.toDataURL('image/png');
+      if (this.wrapper)
+        this.wrapper.style.cursor = `url(${url}) ${Math.max(0, hotx) + pad} ${Math.max(0, hoty) + pad}, auto`;
+    } catch {
+      if (this.wrapper) this.wrapper.style.cursor = 'default';
+    }
   }
 
   private applySystemCursor(name: string): void {
     if (!this.wrapper) return;
-    if (this.cursorImg) this.cursorImg.style.display = 'none';
     this.wrapper.style.cursor = SYSTEM_CURSORS[name] ?? 'default';
   }
 
   // ---- Screenshot (for AI vision) ---------------------------------------
 
-  /** True pixel size of the remote display (0x0 before first frame). */
+  /** True pixel size of the remote display (0x0 before the server says ready). */
   screenSize(): { width: number; height: number } {
+    if (this.remoteW && this.remoteH) return { width: this.remoteW, height: this.remoteH };
     if (!this.canvas) return { width: 0, height: 0 };
     return { width: this.canvas.width, height: this.canvas.height };
   }
@@ -676,6 +888,26 @@ export class NativeSession {
     }
   }
 
+  /**
+   * Send the Windows secure attention sequence. Over RDP a plain
+   * Ctrl+Alt+Del scancode chord is what unlocks the server's lock screen
+   * (which otherwise ignores every other keystroke). Uses the keysym engine
+   * so the scancodes get the same treatment as human typing.
+   */
+  async sendCtrlAltDel(): Promise<void> {
+    this.debug(`sendCtrlAltDel ws=${this.ws?.readyState}`);
+    const chord = [0xffe3, 0xffe9, 0xffff]; // ctrl, alt, del
+    for (const ks of chord) {
+      await this.keyDown(ks);
+      await delay(25);
+    }
+    await delay(80);
+    for (const ks of [...chord].reverse()) {
+      await this.keyUp(ks);
+      await delay(25);
+    }
+  }
+
   /** Clipboard redirection is not wired into the native engine yet. */
   sendClipboardText(_text: string): boolean {
     return false;
@@ -691,10 +923,6 @@ export class NativeSession {
       /* already closed */
     }
     this.ws = null;
-    if (this.cursorUrl) {
-      URL.revokeObjectURL(this.cursorUrl);
-      this.cursorUrl = null;
-    }
     this.setStatus('disconnected');
   }
 }

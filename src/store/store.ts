@@ -97,12 +97,13 @@ export class AppStore {
   aiInputEnabled = true;
 
   /**
-   * Connect-time RDP passwords, keyed by profile id. Memory only by design:
-   * never serialized, and saveConnections() scrubs any legacy password out
-   * of the on-disk profiles. (AI API keys are different and do persist.)
+   * Non-null while a connect-time password prompt is on screen. There is
+   * deliberately no password cache: every connect and reconnect prompts
+   * (the typed password lives only long enough to send the one RDP open
+   * frame, then NativeSession clears it). saveConnections() also scrubs
+   * any legacy password out of the on-disk profiles. AI API keys are
+   * different and do persist.
    */
-  passwords = new Map<string, string>();
-  /** Non-null while a connect-time password prompt is on screen. */
   pendingPassword: { profileId: string; prompt: string } | null = null;
   private passwordResolvers = new Map<string, (pw: string | null) => void>();
 
@@ -159,10 +160,10 @@ export class AppStore {
       // list, getting the secret back off disk.
       let scrubbed = false;
       this.connections = connections.map((c) => {
-        const pw = c.params?.password;
-        if (typeof pw !== 'string' || !('password' in c.params)) return c;
+        if (!c.params || !('password' in c.params)) return c;
         scrubbed = true;
-        if (pw) this.passwords.set(c.id, pw);
+        // Just delete it: a password scrubbed off disk is NOT promoted
+        // into a live credential — the next connect prompts for it.
         const { password: _gone, ...rest } = c.params;
         return { ...c, params: rest };
       });
@@ -230,7 +231,6 @@ export class AppStore {
     const tab = this.tabs.find((t) => t.profileId === id);
     if (tab) this.closeSession(tab.id);
     this.connections = this.connections.filter((c) => c.id !== id);
-    this.passwords.delete(id);
     void this.saveConnections();
     this.emit();
   }
@@ -253,19 +253,17 @@ export class AppStore {
   // ---- connect-time passwords -------------------------------------------
 
   /**
-   * The password to authenticate `profile` with, asking the user when the
-   * protocol prompts at connect time and nothing is cached in memory yet.
-   * Resolves null when the user cancels the prompt (the caller must then
-   * not connect); for protocols without prompts it resolves undefined.
+   * The password to authenticate `profile` with. Protocols that prompt at
+   * connect time ALWAYS ask — nothing is ever cached, not even in memory,
+   * so a second connect or a reconnect prompts again. Resolves null when
+   * the user cancels the prompt (the caller must then not connect); for
+   * protocols without prompts it resolves undefined.
    */
   private async askPassword(profile: ConnectionProfile): Promise<string | null | undefined> {
     const proto = getProtocol(profile.protocol);
     if (!proto?.passwordAtConnect) return undefined;
-    const mem = this.passwords.get(profile.id);
-    if (mem !== undefined) return mem;
     return new Promise<string | null | undefined>((resolve) => {
       this.passwordResolvers.set(profile.id, (pw) => {
-        if (pw !== null) this.passwords.set(profile.id, pw);
         this.pendingPassword = null;
         this.emit();
         resolve(pw);
@@ -474,10 +472,13 @@ export class AppStore {
   }
 
   supportsVision(): boolean {
+    const override = this.settings.ai.vision;
+    if (override === 'yes') return true;
+    if (override === 'no') return false;
     // Heuristic: common vision-capable model families.
     const m = (this.settings.ai.model || '').toLowerCase();
     if (!m) return true; // unknown -> optimistic
-    return /(vision|gpt-4o|gpt-4\.1|4o|4-0|claude|gemini|llava|qwen-vl|internvl|minicpm|pixtral|kimi|grok-4|o\d)/.test(m);
+    return /(vision|gpt-4o|gpt-4\.1|4o|4-0|claude|gemini|llava|qwen[-.]?(vl|3)|internvl|minicpm|pixtral|kimi|grok-4|o\d)/.test(m);
   }
 
   async testConnection(): Promise<void> {

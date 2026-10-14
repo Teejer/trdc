@@ -41,4 +41,5 @@ extern "C" {
     pub fn trdc_key(s: *mut c_void, scancode: c_int, flags: c_int, down: c_int);
     pub fn trdc_unicode(s: *mut c_void, codepoint: c_uint);
     pub fn trdc_kbd_sync(s: *mut c_void, flags: c_int);
+    pub fn trdc_resize(s: *mut c_void, width: c_int, height: c_int) -> c_int;
 }

@@ -10,5 +10,12 @@ fn main() {
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
+    // Second, nastier GPU-path bug seen on this stack: canvas contents draw
+    // fine into the backing store (getImageData proves it) but the
+    // compositor shows a stale black texture — the screen never updates.
+    // Software compositing costs a little GPU offload and shows the truth.
+    if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+    }
     trdc_lib::run()
 }

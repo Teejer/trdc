@@ -444,6 +444,32 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_alt_del_chord_emits_three_scancodes() {
+        // The Windows secure attention sequence must survive the engine:
+        // left ctrl (29), left alt (56), delete (83 extended) — the delete
+        // keysym in particular used to be unreachable from the UI.
+        let mut kb = Keyboard::new("en-us-qwerty");
+        let mut ev = Vec::new();
+        for ks in [0xFFE3u32, 0xFFE9, 0xFFFF] {
+            kb.client_keysym(ks as i32, true, &mut collect(&mut ev));
+        }
+        let keys: Vec<(u16, bool)> = ev
+            .iter()
+            .filter_map(|e| match e {
+                Input::Key { scancode, down, .. } => Some((*scancode, *down)),
+                _ => None,
+            })
+            .collect();
+        assert!(keys.contains(&(83, true)), "delete make missing: {keys:?}");
+        ev.clear();
+        kb.client_keysym(0xFFFF, false, &mut collect(&mut ev));
+        assert!(matches!(
+            ev[0],
+            Input::Key { scancode: 83, flags: 0x0100, down: false }
+        ));
+    }
+
+    #[test]
     fn win_keys_carry_extended_flag() {
         let kb = Keyboard::new("en-us-qwerty");
         let (code, flags) = kb.scancode_for(0xFFEB).unwrap(); // XK_Meta_L (left Win)

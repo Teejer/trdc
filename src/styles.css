@@ -213,10 +213,8 @@ button { font-family: inherit; }
 .native-display { line-height: 0; }
 .native-viewport { position: relative; }
 .native-display canvas { display: block; }
-.native-cursor {
-  position: absolute; left: 0; top: 0; z-index: 5;
-  pointer-events: none; image-rendering: pixelated; user-select: none;
-}
+/* Remote cursor shapes are installed as CSS cursors with the outline baked
+   into the image (NativeSession.installCursorShape); there is no sprite. */
 .ai-takeover {
   position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
   background: var(--purple); color: #0b0b0b; font-weight: 700; font-size: 11px;
@@ -337,6 +335,10 @@ button { font-family: inherit; }
 .field-row .field { flex: 1; }
 .field-inline { display: flex; align-items: center; gap: 9px; padding: 6px 0; }
 .field-inline label { flex: 1; font-size: 12.5px; color: var(--text); }
+.field-inline select {
+  background: var(--bg-elev2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 3px 6px; font-size: 12.5px;
+}
 
 .proto-picker { display: flex; gap: 8px; flex-wrap: wrap; }
 .proto-tile {

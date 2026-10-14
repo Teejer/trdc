@@ -162,14 +162,31 @@ async fn handle_connection(
     // Server -> webview: forward events until the session reports Closed.
     let mut out = tauri::async_runtime::spawn(async move {
         let mut failed = false;
+        let dbg = std::env::var("TRDC_RDP_DEBUG").is_ok();
+        let mut nframe = 0u64;
+        let mut nev = 0u64;
         while let Some(ev) = rx.recv().await {
             let closed = matches!(ev, ServerEvent::Closed { .. });
+            let isframe = matches!(ev, ServerEvent::Frame { .. });
+            nev += 1;
+            if isframe {
+                nframe += 1;
+                if dbg && nframe <= 3 {
+                    eprintln!("[trdc-dbg] out -> ws frame #{nframe}");
+                }
+            }
             let msg = encode_event(ev);
             let stop = ws_tx.send(msg).await.is_err();
             if stop || closed {
+                if dbg && stop {
+                    eprintln!("[trdc-dbg] out: ws send failed at event #{nev} (frames={nframe})");
+                }
                 failed = stop;
                 break;
             }
+        }
+        if dbg {
+            eprintln!("[trdc-dbg] out exiting: events={nev} frames={nframe} failed={failed}");
         }
         // Tell the webview to drop the socket if we ended server-side; if
         // the socket is already gone there is nothing to say.
@@ -188,7 +205,9 @@ async fn handle_connection(
         while let Some(msg) = ws_rx.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    if !handle_input(&mut session, &text) {
+                    if text.starts_with("{\"t\":\"debug\"") {
+                        eprintln!("[webview] {text}");
+                    } else if !handle_input(&mut session, &text) {
                         break; // {"t":"disconnect"}
                     }
                 }
@@ -218,14 +237,28 @@ fn handle_input(session: &mut RunningSession, text: &str) -> bool {
         return true;
     };
     match v.get("t").and_then(|t| t.as_str()).unwrap_or("") {
-        "mouse" => session.mouse(
-            v.get("x").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
-            v.get("y").and_then(|y| y.as_i64()).unwrap_or(0) as i32,
-            v.get("mask").and_then(|m| m.as_i64()).unwrap_or(0) as i32,
-        ),
+        "mouse" => {
+            if std::env::var("TRDC_RDP_DEBUG").is_ok() {
+                eprintln!(
+                    "[trdc-dbg] bridge mouse x={} y={} mask={} live={}",
+                    v.get("x").and_then(|x| x.as_i64()).unwrap_or(0),
+                    v.get("y").and_then(|y| y.as_i64()).unwrap_or(0),
+                    v.get("mask").and_then(|m| m.as_i64()).unwrap_or(0),
+                    session.live()
+                );
+            }
+            session.mouse(
+                v.get("x").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
+                v.get("y").and_then(|y| y.as_i64()).unwrap_or(0) as i32,
+                v.get("mask").and_then(|m| m.as_i64()).unwrap_or(0) as i32,
+            )
+        }
         "key" => {
             let keysym = v.get("keysym").and_then(|k| k.as_i64()).unwrap_or(0) as i32;
             let down = v.get("down").and_then(|d| d.as_i64()).unwrap_or(0) != 0;
+            if std::env::var("TRDC_RDP_DEBUG").is_ok() {
+                eprintln!("[trdc-dbg] bridge key keysym=0x{keysym:x} down={down} live={}", session.live());
+            }
             if keysym != 0 {
                 session.keysym(keysym, down);
             }
@@ -233,6 +266,12 @@ fn handle_input(session: &mut RunningSession, text: &str) -> bool {
         "locks" => {
             let flags = v.get("flags").and_then(|f| f.as_u64()).unwrap_or(0) as u32;
             session.sync_locks(flags);
+        }
+        "resize" => {
+            let width = v.get("width").and_then(|w| w.as_i64()).unwrap_or(0) as i32;
+            let height = v.get("height").and_then(|h| h.as_i64()).unwrap_or(0) as i32;
+            let sent = session.resize(width, height);
+            eprintln!("[trdc-dbg] bridge resize {width}x{height} sent={sent}");
         }
         "disconnect" => return false,
         _ => {}

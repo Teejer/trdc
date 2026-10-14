@@ -33,9 +33,38 @@ typedef struct trdc_session {
     CRITICAL_SECTION lock;
     volatile int stop;
     int mouse_mask; /* Guacamole button mask state */
+    unsigned frames; /* end_paint deliveries, for TRDC_RDP_DEBUG */
     rdpPointer pointer_proto; /* persistent pointer class prototype */
     char error[512];
 } trdc_session;
+
+/* TRDC_RDP_DEBUG=1 turns on connect/paint diagnostics on stderr: what the
+ * server actually sent us (FreeRDP's own update statistics) and whether our
+ * paint path ran. */
+static int trdc_debug_flag(void) {
+    static int cached = -1;
+    if (cached < 0)
+        cached = getenv("TRDC_RDP_DEBUG") ? 1 : 0;
+    return cached;
+}
+#define trdc_dbg(fmt, ...)                                                                     \
+    do {                                                                                       \
+        if (trdc_debug_flag())                                                                 \
+            fprintf(stderr, "[trdc-dbg] " fmt, ##__VA_ARGS__);                                 \
+    } while (0)
+
+/* Print every non-zero update statistic FreeRDP keeps: exactly which PDU
+ * classes the server has sent since connect (bitmaps, orders, surfaces,
+ * pointers...). */
+static void trdc_dump_stats(rdpUpdate *update) {
+    fputc('{', stderr);
+    for (size_t i = 0; i < rdp_stats_max_index(); i++) {
+        uint64_t v = rdp_stats_value_for_index(update, i);
+        if (v)
+            fprintf(stderr, " %s=%llu", rdp_stats_name_for_index(i), (unsigned long long)v);
+    }
+    fprintf(stderr, " }\n");
+}
 
 /* Context extension so C callbacks can find the session. */
 typedef struct {
@@ -79,8 +108,22 @@ static BOOL trdc_end_paint(rdpContext *context) {
         if (y < 0) { h += y; y = 0; }
         if (x + w > (int)gdi->width)  w = (int)gdi->width - x;
         if (y + h > (int)gdi->height) h = (int)gdi->height - y;
-        if (w > 0 && h > 0)
+        if (w > 0 && h > 0) {
+            if (trdc_debug_flag() && (s->frames < 8 || s->frames % 100 == 0)) {
+                /* Sample the damaged region of the GDI buffer itself: does
+                 * it actually hold painted pixels at end_paint time? */
+                const uint8_t *px = gdi->primary_buffer + (size_t)y * gdi->stride + (size_t)x * 4;
+                size_t nonzero = 0;
+                for (size_t i = 0; i < 4096; i++)
+                    nonzero += px[i] != 0;
+                trdc_dbg("end_paint #%u rect=%d,%d %dx%d (gdi %ux%u) px0=%02x%02x%02x%02x "
+                         "nonzero/4k=%zu\n",
+                         s->frames, x, y, w, h, gdi->width, gdi->height, px[0], px[1], px[2],
+                         px[3], nonzero);
+            }
+            s->frames++;
             s->cb.on_frame(s->cb.user, gdi->primary_buffer, (int)gdi->stride, x, y, w, h);
+        }
     }
 
 clear:
@@ -180,10 +223,16 @@ out:
 
 void trdc_key(trdc_session *s, int scancode, int flags, int down) {
     EnterCriticalSection(&s->lock);
-    if (s->inst != NULL && s->inst->context != NULL && s->inst->context->input != NULL)
-        freerdp_input_send_keyboard_event(s->inst->context->input,
-                                          (UINT16)(flags | (down ? KBD_FLAGS_DOWN : KBD_FLAGS_RELEASE)),
-                                          (UINT8)scancode);
+    if (s->inst != NULL && s->inst->context != NULL && s->inst->context->input != NULL) {
+        BOOL ok = freerdp_input_send_keyboard_event(
+            s->inst->context->input,
+            (UINT16)(flags | (down ? KBD_FLAGS_DOWN : KBD_FLAGS_RELEASE)), (UINT8)scancode);
+        if (trdc_debug_flag())
+            trdc_dbg("key sc=%d flags=0x%x down=%d -> ok=%d state=%d suspended=%d\n", scancode,
+                     flags, down, ok, (int)freerdp_get_state(s->inst->context),
+                     (int)freerdp_settings_get_bool(s->inst->context->settings,
+                                                    FreeRDP_SuspendInput));
+    }
     LeaveCriticalSection(&s->lock);
 }
 
@@ -199,6 +248,32 @@ void trdc_kbd_sync(trdc_session *s, int flags) {
     if (s->inst != NULL && s->inst->context != NULL && s->inst->context->input != NULL)
         freerdp_input_send_synchronize_event(s->inst->context->input, (UINT32)flags);
     LeaveCriticalSection(&s->lock);
+}
+
+/* Ask the server for a new desktop resolution (MS-RDPBCGR Monitor Layout
+ * PDU, the mechanism mstsc/xfreerdp use for dynamic resolution). Bridge
+ * thread. The lock keeps the instance alive across the send exactly like
+ * the input entry points; transport_write has its own write lock so the
+ * PDU cannot interleave with event-loop traffic. Returns 1 when the PDU
+ * went out — whether the server honours it arrives as a Deactivate, which
+ * FreeRDP turns into our trdc_desktop_resize callback. Clamped to the
+ * range Windows accepts for RDP sessions. */
+int trdc_resize(trdc_session *s, int width, int height) {
+    /* Intentionally inert. The only safe way to change the resolution of a
+     * live RDP session is the disp DVC channel; the legacy Monitor Layout
+     * PDU sent mid-session is a protocol violation that resets (and worse,
+     * wedges) Windows RDP listeners. Until a disp channel exists, the
+     * desktop size is fixed at connect and pane changes are Fit-scaled.
+     * Kept as an entry point so the bridge/webview plumbing stays wired
+     * for that future implementation. */
+    (void)width;
+    (void)height;
+    EnterCriticalSection(&s->lock);
+    int alive = s->inst != NULL && s->inst->context != NULL;
+    LeaveCriticalSection(&s->lock);
+    trdc_dbg("resize request -> %dx%d ignored (live resize needs the disp channel)\n", width,
+             height);
+    return alive ? 0 : 0;
 }
 
 /* -------------------------------------------------------------- pointer --
@@ -308,9 +383,12 @@ static BOOL trdc_post_connect(freerdp *instance) {
     update->PlaySound = NULL; /* no beeps */
     update->SetKeyboardIndicators = NULL;
 
-    if (s->cb.on_connected)
+    if (s->cb.on_connected) {
+        trdc_dbg("post_connect: gdi ready %ux%u\n", (unsigned)context->gdi->width,
+                 (unsigned)context->gdi->height);
         s->cb.on_connected(s->cb.user, (int)context->gdi->width,
                            (int)context->gdi->height);
+    }
     return TRUE;
 }
 
@@ -396,6 +474,13 @@ int trdc_connect(trdc_session *s, const char *hostname, int port, const char *us
     freerdp_settings_set_uint32(settings, FreeRDP_ConnectionType, 1); /* LAN */
     freerdp_settings_set_uint32(settings, FreeRDP_PerformanceFlags, 0);
     freerdp_settings_set_uint32(settings, FreeRDP_FrameAcknowledge, 2);
+    /* NOTE: the MS-RDPBCGR Monitor Layout PDU is only legal during the
+     * capabilities-exchange phase. Sending one while ACTIVE (a naive
+     * "live resize" attempt) is a protocol violation: it reset the
+     * transport and wedged the RDP listener on real servers. Live resize
+     * must instead go through the disp DVC channel (MS-RDPEDYC), which we
+     * do not load yet. So: never advertise, never send. Desktop size is
+     * chosen once, at connect. */
 
     if (!freerdp_connect(s->inst)) {
         set_error(s, "freerdp_connect failed");
@@ -407,6 +492,9 @@ int trdc_connect(trdc_session *s, const char *hostname, int port, const char *us
     }
 
     rc = 0; /* connected */
+    trdc_dbg("connected to %s:%d, gdi %ux%u\n", hostname, port,
+             (unsigned)width, (unsigned)height);
+    unsigned loop_ticks = 0;
     while (!s->stop && !freerdp_shall_disconnect_context(s->inst->context)) {
         HANDLE handles[TRDC_MAX_HANDLES];
         DWORD count = freerdp_get_event_handles(s->inst->context, handles, TRDC_MAX_HANDLES);
@@ -416,12 +504,18 @@ int trdc_connect(trdc_session *s, const char *hostname, int port, const char *us
             break;
         }
         WaitForMultipleObjects(count, handles, FALSE, 100);
+        if (trdc_debug_flag() && ++loop_ticks % 100 == 0)
+            trdc_dump_stats(s->inst->context->update);
         if (!freerdp_check_event_handles(s->inst->context)) {
             if (!s->stop)
                 set_error(s, "freerdp_check_event_handles failed");
             rc = s->stop ? 0 : 3;
             break;
         }
+    }
+    if (trdc_debug_flag()) {
+        trdc_dump_stats(s->inst->context->update);
+        trdc_dbg("tearing down (rc=%d, end_paint deliveries=%u)\n", rc, s->frames);
     }
 
     freerdp_disconnect(s->inst);
